@@ -41,7 +41,7 @@ Stage 2 и Stage 3 можно вести параллельно после Stage
 Объём:
 
 - Монорепо: `backend/`, `frontend/` (каркас), `docker/`, `.github/workflows/`.
-- Docker Compose: api, worker-*, db (PG16+pgvector), redis, minio, frontend; профайл `langfuse` (опционально).
+- Docker Compose: api, worker-pipeline / worker-ai / worker-notify, beat (singleton), telegram-poller (появится к Stage 6), db (PG16+pgvector), redis, minio, frontend; профайл `langfuse` (опционально). Топология — [ARCHITECTURE.md §11](ARCHITECTURE.md).
 - `core`: pydantic-settings конфигурация, structlog-логирование с request_id, иерархия ошибок, middleware, /health /ready.
 - `identity`: users + refresh_tokens, Alembic initial migration, auth endpoints (register/login/refresh/logout/me).
 - `llm`: каркас LLMClient с мок-провайдером (реальный провайдер — Stage 2), маскирование, `ai_invocations` (схема+запись).

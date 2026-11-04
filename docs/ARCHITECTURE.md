@@ -29,7 +29,7 @@
 | Очереди/сейфы | Celery + Redis | Redis также: rate limiting источников, кэш, distributed locks. Альтернатива (arq/dramatiq) не даёт преимуществ для нашего графа задач (ADR-007) |
 | AI orchestration | LangGraph + `langgraph-checkpoint-postgres` | Проверено: interrupt()/Command(resume=...), PostgresSaver — официальные возможности; персистентность и HITL из коробки (ADR-005) |
 | LLM | Provider abstraction (прямые SDK: OpenAI-совместимые, Anthropic и др.), без LangChain-цепочек | LangGraph используется только как граф; ноды — обычный Python (ADR-006) |
-| Observability LLM | Langfuse v3 (self-hosted или Cloud) | Проверено: self-hosting v3 = 6 контейнеров (web, worker, PG, Redis, ClickHouse, S3/MinIO) — учесть в инфраструктуре; ядро под MIT. Некритичная зависимость: fail-open (ADR-11) |
+| Observability LLM | Langfuse v3 (self-hosted или Cloud) | Проверено: self-hosting v3 = 6 контейнеров (web, worker, PG, Redis, ClickHouse, S3/MinIO) — учесть в инфраструктуре; ядро под MIT. Некритичная зависимость: fail-open (ADR-011) |
 | Файлы | S3-compatible (MinIO в dev) | Резюме/документы приватно; presigned URLs |
 | Frontend | React + TypeScript + Vite + TanStack Query + Zustand + Tailwind/shadcn | Согласовано; сервер — REST + OpenAPI codegen типов |
 | Инфраструктура | Docker Compose (dev/single-node), GitHub Actions CI | K8s отложен до SaaS-фазы |
@@ -61,7 +61,7 @@ flowchart TB
     end
 
     subgraph Data["Хранилища"]
-        PG[("PostgreSQL 16<br/>+ pgvector<br/>+ Langfuse checkpoint tables")]
+        PG[("PostgreSQL 16<br/>+ pgvector<br/>+ схема langgraph<br/>(чекпоинты Copilot)")]
         RD[("Redis<br/>брокер, rate limits, кэш")]
         S3[("S3 / MinIO<br/>резюме, документы")]
     end
@@ -104,7 +104,18 @@ flowchart TB
 Замечания к диаграмме:
 
 - LangGraph checkpointer пишет в ту же PostgreSQL (отдельная схема `langgraph`), поэтому переживающий рестарты workflow не требует дополнительного хранилища.
-- Telegram MVP: long polling через отдельный процесс/воркер; webhook — при публичном деплое.
+- Telegram MVP: long polling отдельным сервисом `telegram-poller` (§11); webhook — при публичном деплое.
+
+### 3.1 Хранилища и источник истины
+
+| Хранилище | Роль | Источник истины? |
+|---|---|---|
+| PostgreSQL | все бизнес-состояния: доменные таблицы + схема `langgraph` (чекпоинты Copilot) | **да** — единственный источник истины бизнес-состояния |
+| Redis | брокер Celery, rate limits, кэш, идемпотентность API, Telegram link-коды | нет — всё пересоздаваемо, потеря Redis не теряет данные |
+| S3/MinIO | бинарные файлы (резюме, экспорт-документы); метаданные и ключи — в PG | да (для файлов); права/владение определяет PG |
+| Langfuse | трейсы LLM, промпты, оценки — только наблюдаемость | нет; недоступность не влияет на продукт (ADR-011) |
+
+**Разделение LangGraph и Langfuse** (устраняет частую путаницу): **чекпоинты workflow хранит LangGraph** в *нашей* PostgreSQL (схема `langgraph`, таблицы библиотеки `langgraph-checkpoint-postgres`); **Langfuse — внешняя по отношению к монолиту система** со собственными хранилищами (в self-hosted v3: свой PG, ClickHouse, Redis, S3), получает только замаскированные трейсы и не хранит бизнес-состояний. Продукт может работать без Langfuse, но не без чекпоинтов LangGraph (при их потере активные copilot-run продолжить нельзя — они переводятся в `failed` и перезапускаются).
 
 ## 4. Модули (домены → пакеты)
 
@@ -207,15 +218,15 @@ flowchart LR
     evaluation --> llm2["llm (infra)"]
     billing --> identity
 
-    job_matching -.->|"событие JobChanged"| job_dedup
-    resume_intel -.->|"событие FactsChanged"| job_matching
-    copilot -.->|"событие MaterialsReady"| notifications
-    job_matching -.->|"событие NewStrongMatches"| notifications
+    job_matching -.->|"событие job.changed"| job_dedup
+    resume_intel -.->|"событие facts.changed"| job_matching
+    copilot -.->|"событие copilot.completed"| notifications
+    job_matching -.->|"событие matches.computed"| notifications
 ```
 
 Пунктир — событийные связи (обратные по потоку), реализуемые через outbox (§7): издатель не знает подписчиков.
 
-Поток данных ingestion: `job_discovery` (оркестратор) вызывает `job_sourcing.fetch` → `job_normalization.normalize_and_store` → `job_dedup.upsert_canonical`; после коммита `job_dedup` публикует `JobChanged`, по которому `job_matching` (подписчик) пересчитывает матч и эмбеддинг.
+Поток данных ingestion: `job_discovery` (оркестратор) вызывает `job_sourcing.fetch` → `job_normalization.normalize_and_store` → `job_dedup.upsert_canonical`; после коммита `job_dedup` публикует `job.changed`, по которому `job_matching` (подписчик) пересчитывает матч и эмбеддинг; завершение пересчёта (`matches.computed`) — триггер уведомлений о сильных матчах. Циклических зависимостей нет: рёбра графа — только по направлению потока; «обратные» уведомления реализованы событиями (издатель не знает подписчиков). Монтирование HTTP-роутеров модулей в одно приложение зависимостью модуля не является.
 
 ## 5. Синхронные и асинхронные операции
 
@@ -236,6 +247,8 @@ flowchart LR
 
 Очереди Celery: `pipeline` (ingestion), `ai` (LLM-задачи), `notify`, `default`. Ретраи и идемпотентность — §8.
 
+**Async API и sync-воркеры:** FastAPI работает с async-сессиями БД (asyncpg), Celery-воркеры — с sync-сессиями (psycopg): в `core` — две фабрики сессий над одной схемой; сессии между процессами не передаются. Транзакционная граница Celery-задачи — сама задача (задачи идемпотентны по своим ключам); выполнение LangGraph в воркере использует синхронный `PostgresSaver` (ADR-005).
+
 Паттерн запрос→задача→результат: API возвращает `202 + job/run id`; клиент поллит статус (`GET /resumes/{id}`, `GET /applications/{id}/copilot/status`). WebSocket/SSE — опция Stage 8 (не MVP).
 
 ## 6. Контракты взаимодействия
@@ -248,15 +261,20 @@ flowchart LR
 
 ### 6.2 Доменные события (transactional outbox)
 
-Издатель в **той же транозакции** пишет событие в `outbox_events`; отдельный диспетчер (Celery-beat + воркер, `events.dispatch`) читает, доставляет подписчикам (в большинстве случаев — постановкой Celery-задачи) и помечает доставленным. Гарантии: at-least-once → обработчики идемпотентны.
+Издатель в **той же транзакции** пишет событие в `outbox_events`; диспетчер (`events.dispatch`: запуск по расписанию beat + быстрый push сразу после коммита) читает пачками `FOR UPDATE SKIP LOCKED`, доставляет подписчикам (постановкой Celery-задачи) и помечает доставленным. Гарантии доставки — **at-least-once**, поэтому:
 
-Каталог событий (MVP):
+- подписчики с побочными эффектами обязаны дедуплицировать обработку: естественным уникальным ключом (`notifications.dedup_key`, `uq_usage` и т.п.) либо записью в общий инбокс `event_deliveries (subscriber, event_id)` — обработка пропускается, если доставка уже зафиксирована ([DATABASE.md](DATABASE.md) §3.14);
+- обработчики обязаны быть идемпотентными и по `event_id`, и по бизнес-ключу (повторная обработка не создаёт дублей).
+
+Каталог событий (MVP). Именование — единая конвенция `<aggregate>.<verb_past>`:
 
 | Событие | Издатель | Подписчики |
 |---|---|---|
 | `resume.parsed` | resume_intelligence | notifications (готовность к ревью фактов) |
 | `facts.changed` | resume_intelligence / career_profile | job_matching (пересчёт матчей профиля) |
-| `job.upserted` / `job.changed` | job_dedup | job_matching (эмбеддинг + матч), notifications (сильные матчи) |
+| `job.upserted` | job_dedup | job_matching (эмбеддинг + матч новой вакансии) |
+| `job.changed` | job_dedup | job_matching (пересчёт при изменении версии) |
+| `matches.computed` | job_matching | notifications (уведомление о сильных матчах) |
 | `copilot.awaiting_input` | copilot | notifications (вопрос пользователю) |
 | `copilot.completed` | copilot | notifications (материалы готовы) |
 | `application.status_changed` | applications | notifications (follow-up напоминания) |
@@ -314,7 +332,7 @@ AppError (base; code, http_status, user_message, details)
 - `pydantic-settings`, класс `Settings` с вложенными суб-настройками на модуль; переменные окружения с префиксом `CP_` (пример: `CP_DATABASE_URL`, `CP_LLM_PRIMARY_PROVIDER`).
 - 12-factor: всё окружение, никаких конфиг-файлов в образе. Для локальной разработки — `.env` (в `.gitignore`).
 - Профили: `local` (dev-упрощения), `production`. Неизвестные/невалидные переменные → отказ старта (fail-fast).
-- Feature flags (минимальный набор): `CP_FEATURE_TELEGRAM`, `CP_FEATURE_DEDUP_SIMILARITY`, `CP_FEATURE_RERANKER`. Хранение — env; UI-флаги — отдельная таблица не нужна в MVP.
+- Feature flags (минимальный набор): `CP_ALLOW_REGISTRATION` (в personal MVP — `false`: публичная регистрация закрыта, см. [SECURITY.md](SECURITY.md) §12, ADR-021), `CP_DB_RLS_ENABLED`, `CP_LLM_DEBUG_CONTENT` (default `false` — политика трассировки, [AI_DESIGN.md §9.3](AI_DESIGN.md)), `CP_FEATURE_TELEGRAM`, `CP_FEATURE_DEDUP_SIMILARITY`, `CP_FEATURE_RERANKER`. Хранение — env; UI-флаги — отдельная таблица не нужна в MVP.
 - Конфигурация источников (код источника, base_url, лимиты) — в БД (`job_sources.config`) с значениями по умолчанию из кода.
 
 ## 10. Секреты
@@ -332,8 +350,10 @@ Docker Compose-сервисы (Stage 1):
 |---|---|
 | `api` | backend: FastAPI + uvicorn |
 | `worker-pipeline` | Celery worker (queues: pipeline, default) |
-| `worker-ai` | Celery worker (queue: ai) + beat-планировщик |
-| `worker-notify` | Celery worker (queue: notify) + telegram poller |
+| `worker-ai` | Celery worker (queue: ai) |
+| `worker-notify` | Celery worker (queue: notify) |
+| `beat` | **отдельный singleton-процесс** Celery Beat: due-поиски, recheck, диспетчер outbox, дайджесты. Не совмещается с воркерами: beat нельзя масштабировать >1 экземпляра |
+| `telegram-poller` | **отдельный процесс** long polling Telegram Bot API (MVP); при публичном деплое заменяется webhook-режимом в `api` |
 | `db` | PostgreSQL 16 + pgvector |
 | `redis` | Redis 7 |
 | `minio` | S3 для файлов |
@@ -365,10 +385,10 @@ ai-career-pilot/
 
 | Решение | Почему | Альтернатива отклонена | ADR |
 |---|---|---|---|
-| Modular monolith | single-user MVP, один деплой, но границы для будущего SaaS | Микросervices: операционная сложность без выгод | [ADR-001](DECISIONS.md) |
+| Modular monolith | single-user MVP, один деплой, но границы для будущего SaaS | Микросервисы: операционная сложность без выгод | [ADR-001](DECISIONS.md) |
 | PostgreSQL+pgvector, FTS+RRF | объём данных мал; одна БД; гибридный поиск | Qdrant/Weaviata/Elastic: ещё 1–2 системы ради выигрыша на наших объёмах | ADR-003/004 |
 | LangGraph | need: stateful, interrupt/resume, HITL, checkpointing — ровно требования Copilot | Оркестрация вручную/Temporal: дублирование/избыточность | ADR-005 |
-| Langfuse, fail-open | трассировка, промпты, датасеты, self-host MIT; отсутствие не должно ломать продукт | LangSmith (лишняя зависимость), без observability (нельзя отлаживать генерацию) | ADR-11 |
+| Langfuse, fail-open | трассировка, промпты, датасеты, self-host MIT; отсутствие не должно ломать продукт | LangSmith (лишняя зависимость), без observability (нельзя отлаживать генерацию) | ADR-011 |
 | Celery+Redis | зрелость, beat-расписания, retry, приоритеты очередей | arq/dramatiq/RQ: меньше экосистемы; Temporal: overkill | ADR-007 |
 | Provider abstraction | смена/деградация провайдеров, cost routing, единый учёт | Прямые SDK-вызовы из модулей: хаос трассировки и стоимости | ADR-006 |
 | Prepare, not send | контроль пользователя, ToS площадок, качество | автоотправка: риски и этика | ADR-008 |

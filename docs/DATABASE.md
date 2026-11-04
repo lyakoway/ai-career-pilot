@@ -10,10 +10,10 @@
 
 | Аспект | Решение |
 |---|---|
-| PK | `id UUID` (v7, генерируется приложением — временно упорядочены, удобны для пагинации и индексов) |
+| PK | `id UUID` (v7, генерируется приложением — временно упорядочены, удобны для пагинации и индексов). Точность аудита v1.1: в Python 3.12 stdlib-`uuid7` нет (появился в 3.14) — генерация библиотекой `uuid6` или собственной функцией; зафиксировано в ADR-016 |
 | Время | `timestamptz` (UTC); `created_at` / `updated_at` на всех таблицах, где важна история |
 | Именование | snake_case; таблицы во множественном числе; индексы `idx_<table>_<cols>`, уникальные `uq_...` |
-| Enum | PostgreSQL `ENUM`-типы для стабильных наборов; jsonb для эволюционирующих структур |
+| Enum | PostgreSQL `ENUM`-типы для стабильных наборов; jsonb для эволюционирующих структур. Значения enum в БД — snake_case (`waiting_user`), в JSON API — camelCase (`waitingUser`, Pydantic alias); соответствие фиксировано слоями, двусмысленности нет |
 | Деньги | `salary` — jsonb `{min, max, currency, period, gross}`; расчётов в БД нет |
 | Soft delete | Не используется; удаление пользователя — каскад (см. §6). История изменений — через версии/аудит-таблицы, а не через `deleted_at` |
 | Схемы | `public` (доменные таблицы), `langgraph` (чекпоинты LangGraph — управляется библиотекой `langgraph-checkpoint-postgres`, не мигрируется нашим Alembic) |
@@ -21,9 +21,9 @@
 
 **Классификация таблиц по tenancy (критично для изоляции, см. §5):**
 
-- **tenant-таблицы** (есть `user_id`): `career_profiles`, `resumes`, `profile_facts`, `job_searches`, `search_runs`(user-атрибут), `job_matches`, `applications`, `application_documents`, `copilot_runs`, `notifications`, `notification_channels`, `subscriptions`, `usage_records`, `ai_invocations`, `refresh_tokens`.
+- **tenant-таблицы** (есть `user_id`): `career_profiles`, `resumes`, `profile_facts`, `job_searches`, `search_runs`(user-атрибут), `job_matches`, `applications`, `application_documents`, `copilot_runs`, `notifications`, `notification_channels`, `subscriptions`, `usage_records`, `ai_invocations`, `refresh_tokens`, `data_exports`.
 - **глобальные таблицы** (общий каталог вакансий): `job_sources`, `source_sync_runs`, `job_postings`, `jobs`, `job_versions`, `job_embeddings`.
-- **сервисные**: `outbox_events`, `evaluation_*` (внутренние, без user-данных).
+- **сервисные** (без пользовательских данных; `audit_events` ссылается на пользователя, но является системным журналом — см. §3.15): `outbox_events`, `event_deliveries`, `audit_events`, `evaluation_*`.
 
 ---
 
@@ -310,7 +310,7 @@ erDiagram
 | base_url | text | |
 | config | jsonb | специфика адаптера (API version, board id, категории) |
 | rate_limit | jsonb | `{requests_per_minute, burst, daily_cap, respect_retry_after: true}` |
-| credentials_enc | bytea | зашифрованные токены (pgcrypto, ключ в env); null для открытых API |
+| credentials_enc | bytea | секреты источника, шифрование на уровне приложения: AES-256-GCM, формат `{key_id, nonce, ciphertext}`, ключ из env (см. [SECURITY.md](SECURITY.md) §4); null для открытых API |
 | is_active | boolean | выключение источника без удаления |
 | health | enum source_health | `healthy` \| `degraded` \| `down` (обновляется по окну запусков) |
 | last_sync_at / last_error_at | timestamptz | |
@@ -672,6 +672,55 @@ erDiagram
 Индексы: `idx_outbox_pending (status, created_at)` — диспетчер `FOR UPDATE SKIP LOCKED`.
 Хранение: purge dispatched старше 7 дней.
 
+#### event_deliveries
+
+Назначение: инбокс для подписчиков доменных событий — дедупликация at-least-once доставки ([ARCHITECTURE.md §6.2](ARCHITECTURE.md)). Подписчик, не имеющий естественного уникального ключа эффекта, перед выполнением фиксирует доставку здесь; повторная доставка пропускается.
+
+| Колонка | Тип | Описание |
+|---|---|---|
+| subscriber | text | имя подписчика (модуль/обработчик), часть PK |
+| event_id | uuid FK→outbox_events, часть PK | |
+| processed_at | timestamptz | |
+
+Индексы: `PK (subscriber, event_id)`.
+Хранение: purge старше 30 дней.
+
+### 3.15 Служебное: аудит и экспорт (identity)
+
+#### audit_events
+
+Назначение: append-only журнал событий безопасности ([SECURITY.md §11](SECURITY.md)). Пишется только серверным кодом.
+
+| Колонка | Тип | Описание |
+|---|---|---|
+| id | uuid PK | |
+| actor_user_id | uuid FK→users ON DELETE SET NULL | null — системные события и анонимизированные записи |
+| actor_alias | text | `deleted_user:{id}` после удаления пользователя (при SET NULL заполняется компенсирующей задачей) |
+| action | text | `login.success`, `refresh.reuse_detected`, `telegram.linked`, `account.deleted`, ... |
+| resource_type / resource_id | text / uuid | объект действия |
+| ip | inet | только для auth-событий |
+| user_agent | text | только для auth-событий |
+| request_id | text | корреляция с логами |
+| context | jsonb | только идентификаторы, без PII-контента |
+| created_at | timestamptz | |
+
+Индексы: `idx_audit_user_time (actor_user_id, created_at DESC)`, `idx_audit_action_time (action, created_at DESC)`.
+Правила: UPDATE/DELETE запрещены (права БД-пользователя приложения); retention 12 мес.
+
+#### data_exports
+
+Назначение: асинхронные экспорты данных пользователя (право на доступ/переносимость).
+
+| Колонка | Тип | Описание |
+|---|---|---|
+| id | uuid PK | |
+| user_id | uuid FK→users CASCADE | |
+| status | text | `processing` \| `ready` \| `failed` \| `expired` |
+| file_key | text | `users/{uid}/exports/{id}.zip` |
+| expires_at | timestamptz | presigned TTL 24 ч; объект удаляется через 48 ч после готовности |
+| error | jsonb | |
+| created_at / finished_at | timestamptz | |
+
 ---
 
 ## 4. Модель вакансий: поток данных
@@ -714,10 +763,14 @@ CREATE POLICY tenant_isolation ON profile_facts
 
 | Данные | Правило |
 |---|---|
-| Удаление пользователя | `DELETE FROM users WHERE id=...` → каскад на все tenant-таблицы; файлы S3 `users/{id}/**` удаляет компенсирующая задача (после коммита); LangGraph-чекпоинты его copilot_runs — отдельной задачей по списку thread_id |
-| Экспорт данных | `GET /api/v1/users/me/export` — сборка архива (JSON + файлы) асинхронно (см. [API_SPEC.md](API_SPEC.md) §6) |
+| Удаление пользователя (единая матрица) | `DELETE FROM users WHERE id=...` → каскад на все tenant-таблицы; затем компенсирующая задача (после коммита): ① файлы S3 `users/{id}/**`; ② LangGraph-чекпоинты его copilot_runs по списку thread_id; ③ `audit_events.actor_user_id → null` + `actor_alias=deleted_user:{id}` (журнал сохраняется — доказательство удаления); ④ Redis: ничего долговременного (link-коды и идемпотентность истекают по TTL ≤ 24 ч); ⑤ Langfuse-трейсы — best-effort (см. [SECURITY.md](SECURITY.md) §8) |
+| Экспорт данных | `POST /api/v1/users/me/export` → `data_exports` (статус → ready, presigned 24 ч, объект S3 удаляется через 48 ч; см. [API_SPEC.md](API_SPEC.md) §7) |
+| audit_events | retention 12 мес.; UPDATE/DELETE запрещены, кроме анонимизации при удалении пользователя |
+| event_deliveries | purge старше 30 дней |
 | job_postings.raw_data | недоверенный контент; компакция (удаление raw) для closed/gone старше 3 мес.; нормализованные поля остаются |
-| jobs/job_versions | closed старше 6 мес. → сжатие до последней версии; старше 12 мес. → `archived`, удаление по политике |
+| jobs/job_versions | closed старше 6 мес. → сжатие до последней версии; старше 12 мес. → `archived`, удаление по политике. **12 мес. — provisional-политика** (не обязательство): пересматривается при первом реальном наполнении каталога вакансий |
+| Очереди Celery/Redis | при удалении пользователя: каждая задача перед записью проверяет существование пользователя (guard clause) и завершается no-op, не создавая данных; активные copilot-run пользователя отменяются (`cancelled`) до удаления; задачи в полёте не могут «воскресить» тенанта (все записи — через tenant-осведомлённые репозитории) |
+| Бэкапы | содержат PII до истечения цикла ротации: бэкапы шифруются обязательно; провижн-политика цикла ≤ 30 дней. «Немедленное удаление из бэкапов» невозможно — фиксируется как остаточный риск ([STAGE_0_1_AUDIT.md §6](STAGE_0_1_AUDIT.md)); restore из бэкапа старше удаления тенанта не должен реплицироваться в прод без вычистки |
 | source_sync_runs / search_runs | purge старше 6 мес. |
 | notifications (sent) | purge старше 90 дней (настройка) |
 | refresh_tokens | purge истёкших/отозванных старше 30 дней |

@@ -20,9 +20,9 @@
 |---|---|---|---|
 | **Unit** | Чистые функции: нормализация текста, fingerprint, evidence binding, компоненты скора, hard filters, конечные автоматы статусов, маскирование PII | pytest, hypothesis (property-based для нормализаторов) | каждый PR, обязателен |
 | **Integration** | Репозитории + PostgreSQL (testcontainers), outbox/диспетчер, Celery-таски (eager), S3 (minio), LangGraph граф с мок-LLM (state transitions, interrupt/resume) | pytest + testcontainers | каждый PR, обязателен |
-| **Contract** | OpenAPI-схема (schemathesis на auth/валидацию), изоляция тенантов (запрос чужого id → 404), контракт Source Adapter (фикстуры сырых ответов источников) | schemathesis, pytest | каждый PR, обязателен |
+| **Contract** | OpenAPI-схема (schemathesis на auth/валидацию), изоляция тенантов по всем поверхностям: API (запрос чужого id → 404), фоновые задачи (вызов Celery-таски с чужим `user_id` → guard no-op, без записи и без утечки данных), graph runs (`copilot resume` чужого run/application → 404), документы и файлы (presigned на чужой объект → 404 до выдачи URL); контракт Source Adapter (фикстуры сырых ответов источников) | schemathesis, pytest | каждый PR, обязателен |
 | **AI evaluation** | Все LLM-компоненты на golden-датасетах (§4) | собственный harness (`make eval`), Langfuse для трейсов | PR с изменением промпта/модели — обязательный локальный прогон; nightly по main |
-| **E2E** | Ключевые пользовательские потоки UJ-1..UJ-4 в staging-окружении с реальной БД и мок-LLM (recorded responses) | Playwright | перед релизом stage |
+| **E2E** | Ключевые пользовательские потоки UJ-1..UJ-4 в staging-окружении с реальной БД и мок-LLM (recorded responses); обязательный кейс — рендеринг недоверенного HTML из вакансии (санитизация не пропускает скрипты) | Playwright | перед релизом stage |
 | **Regression (AI)** | Сравнение с baseline: метрики не хуже порогов; diff-отчёт по кейсам | harness + `evaluation_runs` | тот же триггер, что AI evaluation |
 
 Мок-LLM слой: `LLMClient` подменяется записанными golden-ответами (кассеты) — интеграционные тесты детерминированы и бесплатны; кассеты обновляются при смене промпта вместе с evaluation-прогоном.
@@ -88,7 +88,7 @@ LLM-as-judge правила: judge-модель ≠ рабочая модель 
 | `job_retrieval` | JSONL: вакансии с relevance + запросы | 200 вакансий, 20 запросов | Stage 3, размечает владелец |
 | `job_matching` | JSONL: `{profile_snapshot, job, expected_verdicts}` | 100 | из retrieval-набора + вердикты |
 | `generation` | JSONL: `{profile, job, questions, expected_assertions, style}` | 30 | ручная сборка; assertions = что обязано/запрещено появиться |
-| `prompt_injection` | JSONL: вакансии с инъекциями + ожидаемое поведение | 20 | adversarial set (см. [SECURITY.md](SECURITY.md) §7) |
+| `prompt_injection` | JSONL: вакансии с инъекциями + ожидаемое поведение | 20 | adversarial set: инъекции через описания вакансий **и через загружаемые документы**; кейсы на подмешивание HTML/скриптов в генерацию (ожидание — контент экранирован при рендеринге, [SECURITY.md](SECURITY.md) §6.2, §7) |
 
 Хранение: `backend/tests/eval/datasets/*.jsonl` + генераторы; регистрация в `evaluation_datasets`.
 

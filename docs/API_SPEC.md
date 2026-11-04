@@ -1,10 +1,10 @@
 # CareerPilot AI — API Specification (проект)
 
-- **Статус:** Draft v1.0 (Stage 0 — проектирование, реализации нет).
+- **Статус:** Draft v1.1 (Stage 0.1 — аудит согласованности: исправлены модель токенов, camelCase-примеры, идемпотентность, FSM, контракт экспорта).
 - **Стиль:** REST, JSON, OpenAPI 3.1 (генерируется FastAPI; схема — контракт для фронтенда).
-- **Связанные:** [ARCHITECTURE.md](ARCHITECTURE.md) · [DATABASE.md](DATABASE.md) · [AI_DESIGN.md](AI_DESIGN.md)
+- **Связанные:** [ARCHITECTURE.md](ARCHITECTURE.md) · [DATABASE.md](DATABASE.md) · [AI_DESIGN.md](AI_DESIGN.md) · [SECURITY.md](SECURITY.md)
 
-> Полный maшинами-читаемый OpenAPI появится на Stage 1 (`GET /api/openapi.json`). Здесь — проект: список ресурсов, контракты ключевых операций и примеры.
+> Полный машиночитаемый OpenAPI появится на Stage 1 (`GET /api/openapi.json`). Здесь — проект: список ресурсов, контракты ключевых операций и примеры.
 
 ---
 
@@ -13,17 +13,51 @@
 | Аспект | Решение |
 |---|---|
 | Base URL | `/api/v1` |
-| Аутентификация | `Authorization: Bearer <access_jwt>` (15 мин) + refresh-ротация; все эндпоинты кроме `/auth/*` и `/health` требуют токен |
 | Идентификаторы | UUID v7 в path/теле |
-| Пагинация списков | keyset: `?limit=50&cursor=<opaque>`; ответ содержит `next_cursor` |
-| Фильтры | query-параметры; множественные значения повтором (`?role=ai_engineer&role=llm_engineer`) |
+| Пагинация списков | keyset: `?limit=50&cursor=<opaque>`; ответ содержит `nextCursor` |
+| Фильтры | query-параметры; множественные значения повтором (`?role=aiEngineer&role=llmEngineer`) |
 | Ошибки | единый формат, §8 |
-| Идемпотентность | `Idempotency-Key` заголовок для POST, запускающего задачи (`/resumes`, `/copilot/start`, `searches/{id}/run`) |
-| Локаль | `Accept-Language: ru|en` — тексты ошибок и генерация; хранится в user |
+| Идемпотентность | заголовок `Idempotency-Key` для POST, запускающего задачи (§1.2) |
+| Локаль | `Accept-Language: ru\|en` — тексты ошибок и генерация; хранится в user |
 | Время | ISO 8601 UTC |
-| Формат данных | camelCase в JSON API (Pydantic alias) — конвенция фронтенда |
+| Формат данных | **camelCase** во всех JSON API (Pydantic alias) — конвенция фронтенда. Внутренние структуры БД и graph state остаются snake_case |
 
-Асинхронные операции возвращают `202 Accepted` + ресурс со статусом; клиент поллит ресурс (или поле `status` в ответе). Примеры статусов: resumes (`parsing` → `parsed`), copilot (`running` → `waiting_user` → `completed`).
+### 1.1 Аутентификация и модель токенов
+
+**Access-токен** — JWT (HS256, TTL 15 мин, claims: `sub`, `iat`, `exp`, `jti`, `locale`). Передаётся как `Authorization: Bearer <accessJwt>`.
+
+**Refresh-токен** — **opaque** случайный 256-бит (`rt_` + 43 символа base64url; это НЕ JWT), хранится сервером как sha256-хеш, TTL 30 дней, ротация при каждом использовании. Реюз отозванного refresh → отзыв **всех** сессий пользователя (`401`, код `token_reuse_detected`).
+
+Транспорт refresh-токена (браузер): **httpOnly + Secure + SameSite=Lax cookie `cp_refresh`** — не доступен JS, что снимает риск кражи через XSS. Тело ответа содержит только `accessToken`. Не-браузерные клиенты (скрипты, тесты) могут передать refresh в теле `refreshToken`. Детали и статус решения — [ADR-020](DECISIONS.md) (Accepted, подтверждён 2026-11-04).
+
+Хранение на frontend: access — только в памяти (Zustand-стор без персистентности); refresh — cookie (см. выше); **никогда** — localStorage/sessionStorage.
+
+CSRF (cookie-аутентифицированные операции `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — несовпадение или отсутствие обоих заголовков → `403` (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
+
+Матрица авторизации эндпоинтов:
+
+| Категория | Эндпоинты | Требуется |
+|---|---|---|
+| Public | `POST /auth/register`*, `POST /auth/login`, `POST /auth/refresh` (refresh-токен), `GET /health`, `GET /ready` | ничего / refresh-токен для refresh |
+| Access JWT | все остальные, включая `POST /auth/logout` (refresh в теле) и `PUT /auth/password` | `Authorization: Bearer` |
+
+\* `POST /auth/register` публичен **только в SaaS-фазе**; в personal MVP регистрация закрыта флагом `CP_ALLOW_REGISTRATION=false` → `403` `registration_disabled` (см. [SECURITY.md](SECURITY.md) §12, ADR-021).
+
+Асинхронные операции возвращают `202 Accepted` + ресурс со статусом; клиент поллит ресурс. Примеры статусов: resumes (`parsing` → `parsed`), copilot (`running` → `waitingUser` → `completed`).
+
+### 1.2 Идемпотентность и конкурентность
+
+`Idempotency-Key` (UUID, задаёт клиент): сервер хранит ключ + ответ 24 ч (Redis, scope: user + endpoint); повтор с тем же ключом возвращает закешированный результат, не выполняя операцию повторно.
+
+| Операция | Гарантия |
+|---|---|
+| `POST /resumes` | повтор того же файла → существующая запись (checksum-дедуп в БД); повтор с тем же `Idempotency-Key` → тот же ответ |
+| `POST /applications/{id}/copilot/start` | если run уже активен (`running`/`waitingUser`) → `409` `conflict`; повтор с тем же ключом → идентичный ответ с тем же `runId` |
+| `POST /applications/{id}/copilot/resume` | конкурентные resume сериализуются блокировкой строки `copilot_run` (`SELECT ... FOR UPDATE`): побеждает первый, второй → `409`; повтор того же ключа → replay без повторного выполнения. Ответ на run не в статусе `waitingUser` → `409` |
+| `PATCH /facts/{id}` | оптимистичная блокировка: в теле ожидается `expectedUpdatedAt`; несовпадение → `409` `conflict` |
+| `POST /job-searches/{id}/run` | повторный запуск подавляется, если run уже `running` (→ `409`) |
+
+Правила retry для клиентов: `5xx`/таймаут — безопасный retry (с тем же `Idempotency-Key`); `409` — прочитать состояние ресурса, не ретраить вслепую.
 
 ---
 
@@ -31,27 +65,27 @@
 
 ### 2.1 System
 
-| Метод | Путь | Описание |
-|---|---|---|
-| GET | `/health` | liveness (без auth) |
-| GET | `/ready` | readiness: DB, Redis, S3 (без auth) |
+| Метод | Путь | Auth | Описание |
+|---|---|---|---|
+| GET | `/health` | public | liveness |
+| GET | `/ready` | public | readiness: DB, Redis, S3 |
 
 ### 2.2 Auth & Users (`identity`)
 
-| Метод | Путь | Описание |
-|---|---|---|
-| POST | `/auth/register` | регистрация email+пароль |
-| POST | `/auth/login` | вход → access+refresh |
-| POST | `/auth/refresh` | ротация refresh |
-| POST | `/auth/logout` | отзыв refresh-сессии |
-| PUT | `/auth/password` | смена пароля |
-| GET | `/users/me` | профиль пользователя |
-| PATCH | `/users/me` | locale, timezone, display_name |
-| POST | `/users/me/export` | запрос экспорта данных (async, §6) |
-| GET | `/users/me/export/{export_id}` | статус/ссылка на готовый архив (presigned URL) |
-| DELETE | `/users/me` | удаление аккаунта (подтверждение паролем) |
+| Метод | Путь | Auth | Описание |
+|---|---|---|---|
+| POST | `/auth/register` | public* | регистрация email+пароль (в MVP отключена, §1.1) |
+| POST | `/auth/login` | public | вход → access + refresh-cookie |
+| POST | `/auth/refresh` | refresh | ротация refresh (cookie или тело) |
+| POST | `/auth/logout` | access | отзыв refresh-сессии (refresh из cookie или тела) |
+| PUT | `/auth/password` | access | смена пароля (старый + новый) |
+| GET | `/users/me` | access | профиль пользователя |
+| PATCH | `/users/me` | access | locale, timezone, displayName |
+| POST | `/users/me/export` | access | запрос экспорта данных (async, §7) |
+| GET | `/users/me/export/{exportId}` | access | статус/ссылка на готовый архив (presigned URL) |
+| DELETE | `/users/me` | access | удаление аккаунта (подтверждение паролем) |
 
-### 2.3 Career Profiles (`career_profile`)
+### 2.3 Career Profiles (`career_profile`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
@@ -59,31 +93,32 @@
 | GET / PATCH / DELETE | `/career-profiles/{id}` | чтение / изменение / удаление |
 | POST | `/career-profiles/{id}/activate` | сделать активным |
 
-### 2.4 Resumes & Facts (`resume_intelligence`)
+### 2.4 Resumes & Facts (`resume_intelligence`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
 | POST | `/resumes` | загрузка файла (multipart), запуск парсинга (202) |
 | GET | `/resumes` | список со статусами |
 | GET / DELETE | `/resumes/{id}` | статус/метаданные / удаление |
-| GET | `/resumes/{id}/file` | presigned URL на файл |
+| GET | `/resumes/{id}/file` | выдача файла (presigned URL) |
+| POST | `/resumes/{id}/reparse` | повторный парсинг |
 | GET | `/career-profiles/{id}/facts` | факты профиля (`?type=&status=`) |
 | POST | `/career-profiles/{id}/facts` | добавить факт вручную |
-| PATCH | `/facts/{fact_id}` | подтвердить / изменить / отклонить |
-| POST | `/facts/{fact_id}/confirm` | подтвердить как есть |
-| POST | `/resumes/{id}/reparse` | повторный парсинг |
+| PATCH | `/facts/{factId}` | действие над фактом: `action: confirm \| edit \| reject` (+ `expectedUpdatedAt`) |
 
-### 2.5 Job Searches & Sources (`job_discovery`, `job_sourcing`)
+Дублирующий `POST /facts/{id}/confirm` удалён (аудит v1.1): подтверждение — частный случай `PATCH` с `action=confirm`.
+
+### 2.5 Job Searches & Sources (`job_discovery`, `job_sourcing`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
 | GET / POST | `/job-searches` | список / создание подписки |
 | GET / PATCH / DELETE | `/job-searches/{id}` | управление |
-| POST | `/job-searches/{id}/run` | ручной запуск (202) |
+| POST | `/job-searches/{id}/run` | ручной запуск (202; 409 если уже running) |
 | GET | `/job-searches/{id}/runs` | история прогонов |
 | GET | `/sources` | реестр источников + health (read-only) |
 
-### 2.6 Jobs & Matches (`job_dedup`, `job_matching`)
+### 2.6 Jobs & Matches (`job_dedup`, `job_matching`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
@@ -91,30 +126,30 @@
 | GET | `/jobs/{id}` | карточка вакансии (canonical + postings-источники) |
 | GET | `/jobs/{id}/versions` | история изменений |
 | POST | `/jobs/{id}/recheck` | ручная верификация свежести (202) |
-| GET | `/matches` | матчи активного профиля (`?min_score=&decision=&hard_filter=`) |
+| GET | `/matches` | матчи активного профиля (`?minScore=&decision=&hardFilter=`) |
 | GET | `/matches/{id}` | матч с полным объяснением |
 | POST | `/jobs/{id}/match` | рассчитать матч по требованию (202) |
-| PATCH | `/matches/{id}/decision` | решение: interested / dismissed / not_interested / will_apply |
+| PATCH | `/matches/{id}/decision` | решение: interested / dismissed / notInterested / willApply |
 
-### 2.7 Applications & Copilot (`applications`, `copilot`)
+### 2.7 Applications & Copilot (`applications`, `copilot`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
-| GET / POST | `/applications` | список / создать черновик (job_id) |
+| GET / POST | `/applications` | список / создать черновик (jobId) |
 | GET / PATCH / DELETE | `/applications/{id}` | карточка / статусы и поля / архив |
-| POST | `/applications/{id}/copilot/start` | запуск workflow (202) |
+| POST | `/applications/{id}/copilot/start` | запуск workflow (202; 409 при активной run) |
 | GET | `/applications/{id}/copilot/status` | состояние run: нода, статус, вопросы/ревью |
-| POST | `/applications/{id}/copilot/resume` | ответ на interrupt / резюме после паузы |
+| POST | `/applications/{id}/copilot/resume` | ответ на interrupt / продолжение (§1.2 — конкурентность) |
 | POST | `/applications/{id}/copilot/cancel` | отмена run |
 | GET | `/applications/{id}/documents` | документы (все версии) |
-| GET | `/documents/{doc_id}` | версия документа |
-| PATCH | `/documents/{doc_id}` | пользовательская правка (новая версия) |
-| POST | `/documents/{doc_id}/approve` | одобрение (финализация) |
-| POST | `/documents/{doc_id}/regenerate` | перегенерация с фидбеком |
-| GET | `/documents/{doc_id}/export?format=md|docx|pdf` | скачивание |
+| GET | `/documents/{documentId}` | версия документа |
+| PATCH | `/documents/{documentId}` | пользовательская правка (новая версия) |
+| POST | `/documents/{documentId}/approve` | одобрение (финализация) |
+| POST | `/documents/{documentId}/regenerate` | перегенерация с фидбеком |
+| GET | `/documents/{documentId}/export?format=md\|txt\|docx` | экспорт — контракт в §6.4 |
 | GET | `/applications/stats` | воронка (counts, конверсии) |
 
-### 2.8 Notifications (`notifications`)
+### 2.8 Notifications (`notifications`) — все access
 
 | Метод | Путь | Описание |
 |---|---|---|
@@ -133,25 +168,33 @@
 
 ```json
 // request
-{ "email": "user@example.com", "password": "•••••••••••", "locale": "ru" }
+{ "email": "user@example.com", "password": "correct-horse-battery", "locale": "ru" }
 
-// 201
-{ "id": "0192a5f0-...", "email": "user@example.com", "locale": "ru",
-  "access_token": "eyJ...", "refresh_token": "eyJ...", "token_type": "bearer", "expires_in": 900 }
+// 201 (+ Set-Cookie: cp_refresh=...; HttpOnly; Secure; SameSite=Lax)
+{ "id": "0192a5f0-8c3e-7cc2-9f31-3a2b6d8e1f01", "email": "user@example.com",
+  "locale": "ru", "accessToken": "eyJ...", "tokenType": "bearer", "expiresIn": 900 }
 ```
 
-### POST /api/v1/auth/login → 200 (тот же формат токенов); POST /api/v1/auth/refresh
+### POST /api/v1/auth/login → 200 (тот же формат); POST /api/v1/auth/refresh
 
 ```json
-// request
-{ "refresh_token": "eyJ..." }
-// 200 — новая пара; старый refresh отзывается
-{ "access_token": "eyJ...", "refresh_token": "eyJ...", "expires_in": 900 }
+// request (браузер — пустое тело, refresh берётся из cookie; CLI — в теле)
+{ "refreshToken": "rt_3FZ9tKq2vX8mB4wY6nJ1sD5gH7kL0pR2aE4uI9oP3cxA" }
+
+// 200 — новая пара (ротация); старый refresh отзывается
+{ "accessToken": "eyJ...", "tokenType": "bearer", "expiresIn": 900 }
+// + Set-Cookie: cp_refresh=<новый opaque>; HttpOnly; Secure; SameSite=Lax
+```
+
+```json
+// 401 — реюз отозванного refresh (все сессии пользователя отозваны)
+{ "error": { "code": "token_reuse_detected", "message": "Refresh token reuse detected; all sessions revoked",
+             "details": {}, "requestId": "0192aa02-..." } }
 ```
 
 ## 4. Примеры: резюме и факты
 
-### POST /api/v1/resumes (multipart/form-data)
+### POST /api/v1/resumes (multipart/form-data, Idempotency-Key: <uuid>)
 
 ```
 resume=@cv_ai_engineer.pdf
@@ -159,69 +202,78 @@ resume=@cv_ai_engineer.pdf
 
 ```json
 // 202
-{ "id": "0192a7c1-...", "status": "parsing", "filename": "cv_ai_engineer.pdf",
-  "size_bytes": 241_331, "created_at": "2026-11-03T12:00:00Z" }
+{ "id": "0192a7c1-5d20-7b1a-8e4c-1f2a3b4c5d61", "status": "parsing",
+  "filename": "cv_ai_engineer.pdf", "sizeBytes": 241331, "createdAt": "2026-11-04T12:00:00Z" }
 ```
 
 ### GET /api/v1/resumes/{id} — после завершения
 
 ```json
-{ "id": "0192a7c1-...", "status": "parsed", "language": "en", "parsed_at": "2026-11-03T12:01:40Z",
-  "facts_summary": { "total": 87, "draft": 87, "confirmed": 0, "by_type": { "skill": 34, "experience": 6, "project": 9 } } }
+{ "id": "0192a7c1-...", "status": "parsed", "language": "en", "parsedAt": "2026-11-04T12:01:40Z",
+  "factsSummary": { "total": 87, "draft": 87, "confirmed": 0,
+                    "byType": { "skill": 34, "experience": 6, "project": 9 } } }
 ```
 
 ### GET /api/v1/career-profiles/{id}/facts?type=experience&status=draft
 
 ```json
 { "items": [
-  { "id": "0192a8e2-...", "fact_type": "experience", "status": "draft", "confidence": 0.93,
-    "source": "llm_extraction",
+  { "id": "0192a8e2-...", "factType": "experience", "status": "draft", "confidence": 0.93,
+    "source": "llm_extraction", "updatedAt": "2026-11-04T12:02:00Z",
     "payload": { "company": "OOO Romashka", "title": "Senior Frontend Developer",
                  "start": "2022-03", "end": null, "employment": "full_time" },
-    "evidence": [ { "resume_id": "0192a7c1-...", "section": "experience",
+    "evidence": [ { "resumeId": "0192a7c1-...", "section": "experience",
                     "quote": "Senior Frontend Developer @ Romashka (Mar 2022 — present) ..." } ],
     "verified": false }
 ],
-"next_cursor": null }
+"nextCursor": null }
 ```
 
-### PATCH /api/v1/facts/{fact_id} — подтверждение с правкой
+### PATCH /api/v1/facts/{factId} — подтверждение с правкой
 
 ```json
 // request
-{ "action": "confirm", "payload_edits": { "end": "2025-11" } }
+{ "action": "confirm", "expectedUpdatedAt": "2026-11-04T12:02:00Z",
+  "payloadEdits": { "end": "2025-11" } }
 // 200
-{ "id": "0192a8e2-...", "status": "confirmed", "verified": true, "verified_at": "2026-11-03T12:10:00Z",
+{ "id": "0192a8e2-...", "status": "confirmed", "verified": true, "verifiedAt": "2026-11-04T12:10:00Z",
   "payload": { "company": "OOO Romashka", "title": "Senior Frontend Developer",
                "start": "2022-03", "end": "2025-11", "employment": "full_time" } }
 ```
 
+```json
+// 409 — факт изменился между чтением и записью (оптимистичная блокировка)
+{ "error": { "code": "conflict", "message": "Fact was modified by another request",
+             "details": { "currentUpdatedAt": "2026-11-04T12:05:11Z" }, "requestId": "..." } }
+```
+
 ## 5. Примеры: вакансии и матчи
 
-### GET /api/v1/matches?min_score=0.65&hard_filter=passed&limit=2
+### GET /api/v1/matches?minScore=0.65&hardFilter=passed&limit=2
 
 ```json
 { "items": [
   { "id": "0192b1a0-...", "job": { "id": "0192b0ff-...", "title": "LLM Application Engineer",
-      "company_name": "Acme AI", "remote_type": "remote", "salary": {"min": 350000, "max": 500000, "currency": "RUB"},
-      "published_at": "2026-11-01T09:00:00Z", "best_source_url": "https://..." },
-    "final_score": 0.81, "hard_filter_passed": true,
+      "companyName": "Acme AI", "remoteType": "remote",
+      "salary": { "min": 350000, "max": 500000, "currency": "RUB" },
+      "publishedAt": "2026-11-01T09:00:00Z", "bestSourceUrl": "https://..." },
+    "finalScore": 0.81, "hardFilterPassed": true,
     "components": { "skills": 0.82, "experience": 0.9, "semantics": 0.76, "logistics": 1.0 },
-    "skill_gaps": [ {"requirement": "Kubernetes в проде", "critical": true} ],
-    "decision": "none", "computed_at": "2026-11-03T13:00:00Z" }
+    "skillGaps": [ { "requirement": "Kubernetes в проде", "critical": true } ],
+    "decision": "none", "computedAt": "2026-11-04T13:00:00Z" }
 ],
-"next_cursor": "Mg" }
+"nextCursor": "Mg" }
 ```
 
 ### GET /api/v1/matches/{id} — фрагмент объяснения
 
 ```json
-{ "id": "0192b1a0-...", "final_score": 0.81, "hard_filter_passed": true,
+{ "id": "0192b1a0-...", "finalScore": 0.81, "hardFilterPassed": true,
   "explanation": {
     "summary": "Сильный матч: 8/10 обязательных требований закрыты",
     "evidence": [
       { "requirement": "Опыт production RAG", "verdict": "covered",
-        "fact_ids": ["0192a8e5-..."], "evidence_quote": "built hybrid retrieval (BM25+pgvector), deflection +35%" },
+        "factIds": ["0192a8e5-..."], "evidenceQuote": "built hybrid retrieval (BM25+pgvector), deflection +35%" },
       { "requirement": "Kubernetes", "verdict": "gap", "critical": true,
         "hint": "в профиле нет подтверждённого факта; есть Docker (fact 0192a8f0-...)" }
     ] },
@@ -234,73 +286,84 @@ resume=@cv_ai_engineer.pdf
 
 ```json
 // request
-{ "job_id": "0192b0ff-...", "source": "copilot" }
+{ "jobId": "0192b0ff-...", "source": "copilot" }
 // 201
-{ "id": "0192c000-...", "job_id": "0192b0ff-...", "status": "draft", "created_at": "..." }
+{ "id": "0192c000-...", "jobId": "0192b0ff-...", "status": "draft", "createdAt": "..." }
 ```
 
-### POST /api/v1/applications/{id}/copilot/start → 202
+### POST /api/v1/applications/{id}/copilot/start (Idempotency-Key: <uuid>) → 202
 
 ```json
-{ "run_id": "0192c001-...", "status": "running", "current_node": "job_analyzer" }
+{ "runId": "0192c001-...", "status": "running", "currentNode": "job_analyzer" }
 ```
 
 ### GET /api/v1/applications/{id}/copilot/status — граф дошёл до request_user_input
 
 ```json
-{ "run_id": "0192c001-...", "status": "waiting_user", "current_node": "request_user_input",
+{ "runId": "0192c001-...", "status": "waitingUser", "currentNode": "request_user_input",
   "await": {
     "kind": "questions",
     "questions": [
       { "id": "q1", "question": "Есть ли у вас опыт выравнивания LLM (LoRA/DPO) на своих проектах?",
         "why": "Вакансия упоминает fine-tuning как обязательное требование",
-        "related_gap": "ML fine-tuning", "optional": true },
+        "relatedGap": "ML fine-tuning", "optional": true },
       { "id": "q2", "question": "Какой самый заметный измеримый эффект дал ваш RAG-проект?",
-        "why": "Усилит резюме и cover letter", "related_gap": null, "optional": true }
+        "why": "Усилит резюме и cover letter", "relatedGap": null, "optional": true }
     ]
   },
-  "progress": { "nodes_done": ["job_analyzer", "profile_matcher", "gap_analyzer"] } }
+  "progress": { "nodesDone": ["job_analyzer", "profile_matcher", "gap_analyzer"] } }
 ```
 
 ### POST /api/v1/applications/{id}/copilot/resume — ответ пользователя
 
 ```json
-// request
+// request (Idempotency-Key: <uuid>)
 { "answers": [ { "id": "q1", "answer": "Да, LoRA на Llama-3 для классификации тикетов, +12% accuracy",
-                 "confirm_fact": true },
-               { "id": "q2", "answer": "deflection 35% за квартал", "confirm_fact": true } ] }
+                 "confirmFact": true },
+               { "id": "q2", "answer": "deflection 35% за квартал", "confirmFact": true } ] }
 // 202
-{ "run_id": "0192c001-...", "status": "running", "current_node": "resume_generator" }
+{ "runId": "0192c001-...", "status": "running", "currentNode": "resume_generator" }
 ```
 
-`confirm_fact: true` — ответ сохраняется как новый `profile_fact` (source=user_input, verified), переиспользуется в дальнейших откликах.
+`confirmFact: true` — ответ сохраняется как новый `profile_fact` (source=user_input, verified), переиспользуется в дальнейших откликах.
 
 ### GET .../copilot/status — граф дошёл до human_review
 
 ```json
-{ "status": "waiting_user", "current_node": "human_review",
+{ "status": "waitingUser", "currentNode": "human_review",
   "await": {
     "kind": "review",
     "documents": [
-      { "doc_id": "0192d001-...", "kind": "resume", "version": 1, "review_status": "draft",
-        "fact_check": { "supported": 41, "unsupported": 0, "unverifiable": 2,
-          "flags": [ {"claim": "увеличил конверсию откликов", "verdict": "unverifiable", "note": "нет измеримого факта в профиле"} ] } },
-      { "doc_id": "0192d002-...", "kind": "cover_letter", "version": 1 },
-      { "doc_id": "0192d003-...", "kind": "answers", "version": 1 }
+      { "documentId": "0192d001-...", "kind": "resume", "version": 1, "reviewStatus": "draft",
+        "factCheck": { "supported": 41, "unsupported": 0, "unverifiable": 2,
+          "flags": [ { "claim": "увеличил конверсию откликов", "verdict": "unverifiable",
+                       "note": "нет измеримого факта в профиле" } ] } },
+      { "documentId": "0192d002-...", "kind": "cover_letter", "version": 1 },
+      { "documentId": "0192d003-...", "kind": "answers", "version": 1 }
     ] },
-  "progress": { "nodes_done": ["...генераторы", "fact_checker"] } }
+  "progress": { "nodesDone": ["...генераторы", "fact_checker"] } }
 ```
 
-### POST /api/v1/documents/{doc_id}/approve → 200; итог workflow
+### POST /api/v1/documents/{documentId}/approve → 200; итог workflow
 
 ```json
-{ "application_id": "0192c000-...", "status": "completed",
-  "application_status": "materials_ready",
-  "documents": [ { "kind": "resume", "version": 1, "review_status": "approved" },
-                 { "kind": "cover_letter", "version": 2, "review_status": "approved" } ] }
+{ "applicationId": "0192c000-...", "status": "completed",
+  "applicationStatus": "materials_ready",
+  "documents": [ { "kind": "resume", "version": 1, "reviewStatus": "approved" },
+                 { "kind": "cover_letter", "version": 2, "reviewStatus": "approved" } ] }
 ```
 
-### Экспорт: GET /api/v1/documents/{doc_id}/export?format=docx → 302 на presigned URL (TTL 15 мин)
+### 6.4 Контракт экспорта документов
+
+Форматы: `md`, `txt` — синхронно; `docx` — асинхронный рендер; `pdf` — отложено (Stage 6+; ранее заявлен в PRD — согласовано Stage 0.1).
+
+```
+GET /api/v1/documents/{id}/export?format=md|txt   → 200, тело файла (content-type: text/markdown | text/plain)
+GET /api/v1/documents/{id}/export?format=docx     → 202 { "exportId": "...", "status": "rendering" }
+GET /api/v1/documents/{id}/export/{exportId}      → 200 { "status": "ready", "downloadUrl": "<presigned, TTL 15 мин>" }
+```
+
+`downloadUrl` — presigned URL на S3-объект `users/{uid}/applications/{aid}/{kind}-v{n}.docx`; доступ только владельцу (проверка до выдачи URL).
 
 ## 7. Примеры: остальные ресурсы
 
@@ -311,28 +374,47 @@ resume=@cv_ai_engineer.pdf
 { "name": "AI/LLM Engineer, remote",
   "query": { "keywords": ["AI Engineer", "LLM Engineer", "AI Application Engineer"],
              "sources": ["arbeitnow", "remotive", "adzuna", "hn_algolia"],
-             "remote_only": true },
-  "schedule": { "interval_minutes": 120 } }
+             "remoteOnly": true },
+  "schedule": { "intervalMinutes": 120 } }
 // 201
-{ "id": "0192e000-...", "is_active": true, "next_run_at": "2026-11-03T14:00:00Z", "...": "..." }
+{ "id": "0192e000-...", "isActive": true, "nextRunAt": "2026-11-04T14:00:00Z", "...": "..." }
 ```
 
 ### POST /api/v1/notifications/telegram/link-code
 
 ```json
 // 201
-{ "code": "CP-8F3K2Q", "expires_in": 600,
-  "bot_username": "careerpilot_bot", "instructions": "Отправьте код боту в Telegram" }
+{ "code": "CP-8F3K2QA7", "expiresIn": 600,
+  "botUsername": "careerpilot_bot", "instructions": "Отправьте код боту в Telegram" }
 ```
+
+Код: 8 символов (Crockford base32, ~40 бит энтропии), одноразовый, хранится как sha256 (Redis, TTL 10 мин), не более 5 попыток ввода и 5 кодов/час на пользователя — детали [SECURITY.md](SECURITY.md) §2.
 
 ### POST /api/v1/users/me/export → 202
 
 ```json
-{ "export_id": "0192f000-...", "status": "processing",
-  "note": "Готовый архив будет доступен по GET /users/me/export/{export_id} (presigned URL)" }
+{ "exportId": "0192f000-...", "status": "processing",
+  "note": "Статус и ссылка — GET /users/me/export/{exportId} (готовый архив, presigned URL, TTL 24 ч)" }
 ```
 
-### Конечный автомат application.status
+### 7.4 Application State Machine
+
+Переходы статусов (исполнитель: `copilot` — автоматические, `user` — ручные через API):
+
+| Из | В | Условие / исполнитель |
+|---|---|---|
+| draft | awaiting_input | copilot: start workflow дошёл до interrupt |
+| draft | materials_ready | copilot: workflow без вопросов дошёл до одобрения |
+| draft | submitted | user: отклик отправлен вручную без копайлота |
+| awaiting_input | materials_ready | copilot: ответы получены, документы одобрены в human_review |
+| awaiting_input | draft | user: cancel/отклонение вопросов |
+| materials_ready | submitted | user: отправил отклик самостоятельно (appliedAt) |
+| submitted | interview | user |
+| submitted / interview | offer | user |
+| submitted / interview / offer | rejected \| withdrawn | user |
+| любой не-terminal | archived | user |
+
+Terminal: `rejected`, `withdrawn`, `archived` (редактирование карточки остаётся). Любой иной переход → `422` `domain_rule_violation`. История переходов — `application_status_history`.
 
 ```
 draft ──start copilot──▶ awaiting_input ──answers──▶ (генерация) ──approval──▶ materials_ready
@@ -347,17 +429,17 @@ submitted/interview/offer ─▶ rejected | withdrawn
 ```json
 // 404
 { "error": { "code": "not_found", "message": "Resume not found",
-             "details": {"resource": "resume"}, "request_id": "0192aa01-..." } }
+             "details": { "resource": "resume" }, "requestId": "0192aa01-..." } }
 // 422 (бизнес-правило)
 { "error": { "code": "domain_rule_violation",
              "message": "Cannot transition application from 'offer' to 'submitted'",
-             "details": {"from": "offer", "to": "submitted"}, "request_id": "..." } }
+             "details": { "from": "offer", "to": "submitted" }, "requestId": "..." } }
 // 429
 { "error": { "code": "rate_limited", "message": "Too many copilot runs",
-             "details": {"retry_after_seconds": 3600}, "request_id": "..." } }
+             "details": { "retryAfterSeconds": 3600 }, "requestId": "..." } }
 ```
 
-Каталог кодов: `validation_error`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `domain_rule_violation`, `rate_limited`, `external_service_error`, `internal_error`. Сообщения локализуются по `Accept-Language` (ru/en), `code` стабилен для фронтенда.
+Каталог кодов: `validation_error`, `unauthorized`, `token_reuse_detected`, `forbidden`, `registration_disabled`, `not_found`, `conflict`, `domain_rule_violation`, `rate_limited`, `external_service_error`, `internal_error`. Сообщения локализуются по `Accept-Language` (ru/en), `code` стабилен для фронтенда.
 
 ## 9. Версионирование и совместимость
 
@@ -368,6 +450,7 @@ submitted/interview/offer ─▶ rejected | withdrawn
 ## 10. Замечания для Stage 1
 
 - OpenAPI-схема фронтенд получает через codegen (`openapi-typescript`) — ручных типов на фронтенде быть не должно.
-- Все ответы списков — единая обёртка `{items, next_cursor}`.
+- Все ответы списков — единая обёртка `{items, nextCursor}`.
 - CORS: только origin Dashboard; для personal-деплоя допустим same-origin (nginx проксирует `/api`).
+- Cookie `cp_refresh`: path=`/api/v1/auth`, чтобы не отправляться на каждый запрос.
 - Rate limiting API: per-user (Redis, token bucket) — базовые пределы Stage 8, copilot-лимиты раньше (стоимость LLM).

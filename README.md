@@ -17,7 +17,8 @@ AI-powered Career Assistant: агрегация вакансий из разре
 | [docs/EVALUATION.md](docs/EVALUATION.md) | Стратегия evaluation, метрики, датасеты |
 | [docs/SECURITY.md](docs/SECURITY.md) | Безопасность, privacy, изоляция данных |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Этапы разработки Stage 1–8 |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Архитектурные решения (ADR-001…019) |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Архитектурные решения (ADR-001…021) |
+| [docs/STAGE_0_1_AUDIT.md](docs/STAGE_0_1_AUDIT.md) | Аудит согласованности Stage 0.1: противоречия, исправления, открытые вопросы |
 
 ## Планируемый стек
 
