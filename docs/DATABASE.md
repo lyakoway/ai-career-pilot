@@ -23,7 +23,7 @@
 
 - **tenant-таблицы** (есть `user_id`): `career_profiles`, `resumes`, `profile_facts`, `job_searches`, `search_runs`(user-атрибут), `job_matches`, `applications`, `application_documents`, `copilot_runs`, `notifications`, `notification_channels`, `subscriptions`, `usage_records`, `ai_invocations`, `refresh_tokens`, `data_exports`.
 - **глобальные таблицы** (общий каталог вакансий): `job_sources`, `source_sync_runs`, `job_postings`, `jobs`, `job_versions`, `job_embeddings`.
-- **сервисные** (без пользовательских данных; `audit_events` ссылается на пользователя, но является системным журналом — см. §3.15): `outbox_events`, `event_deliveries`, `audit_events`, `evaluation_*`.
+- **сервисные** (без пользовательских данных; аудит связывается с пользователем только через отдельную таблицу `audit_subjects` — см. §3.15): `outbox_events`, `event_deliveries`, `audit_events`, `audit_subjects`, `evaluation_*`.
 
 ---
 
@@ -694,8 +694,7 @@ erDiagram
 | Колонка | Тип | Описание |
 |---|---|---|
 | id | uuid PK | |
-| actor_user_id | uuid FK→users ON DELETE SET NULL | null — системные события и анонимизированные записи |
-| actor_alias | text | `deleted_user:{id}` после удаления пользователя (при SET NULL заполняется компенсирующей задачей) |
+| actor_subject_id | uuid | ссылка на `audit_subjects.subject_id`; null — системные события. **Прямого FK на users нет** — удаление пользователя не затрагивает и не удаляет журнал |
 | action | text | `login.success`, `refresh.reuse_detected`, `telegram.linked`, `account.deleted`, ... |
 | resource_type / resource_id | text / uuid | объект действия |
 | ip | inet | только для auth-событий |
@@ -704,8 +703,22 @@ erDiagram
 | context | jsonb | только идентификаторы, без PII-контента |
 | created_at | timestamptz | |
 
-Индексы: `idx_audit_user_time (actor_user_id, created_at DESC)`, `idx_audit_action_time (action, created_at DESC)`.
-Правила: UPDATE/DELETE запрещены (права БД-пользователя приложения); retention 12 мес.
+Идексация: `idx_audit_subject_time (actor_subject_id, created_at DESC)`, `idx_audit_action_time (action, created_at DESC)`.
+Правила: UPDATE/DELETE запрещены (права БД-пользователя приложения) **без исключений** — privacy-трансформация старых записей не требуется (модель subject исключает PII и исходные пользовательские идентификаторы из событий); retention 12 мес.
+
+#### audit_subjects
+
+Назначение: единственная точка связи аудита с пользователем; при удалении пользователя связь уничтожается, сами события сохраняются ([SECURITY.md](SECURITY.md) §11).
+
+| Колонка | Тип | Описание |
+|---|---|---|
+| subject_id | uuid PK | случайный UUIDv4 — не выводим из user_id и не упорядочен |
+| user_id | uuid FK→users **ON DELETE CASCADE**, UNIQUE | каскад удаляет только связь, не события |
+| created_at | timestamptz | первое аудиторское событие пользователя |
+
+Создаётся лениво при первом аудиторском событии пользователя; запросы «события пользователя» — join, работающий только пока пользователь существует.
+
+**FK-семантика (намеренная, финальная проверка Stage 0.2):** `audit_events.actor_subject_id` — **plain uuid без FK-констрейнта** на `audit_subjects`. Причина: FK с `ON DELETE NO ACTION/RESTRICT` заблокировал бы удаление связи при удалении пользователя, а `ON DELETE SET NULL` мутировал бы append-only события. Без FK удаление пользователя каскадно удаляет только `audit_subjects` — события остаются с «осиротевшими» `subject_id`, что является **ожидаемым состоянием**: отображение subject→user уничтожено, восстановить исходный `user_id` невозможно (subject — случайный UUIDv4, не выводимый из user_id; таблицы-отображения больше нет). Косвенно идентифицирующие поля сохранённых auth-событий (`ip`, `user_agent`) остаются — принятый остаточный риск для security-форензики, окно ограничено retention 12 мес. ([SECURITY.md](SECURITY.md) §11.)
 
 #### data_exports
 
@@ -717,7 +730,7 @@ erDiagram
 | user_id | uuid FK→users CASCADE | |
 | status | text | `processing` \| `ready` \| `failed` \| `expired` |
 | file_key | text | `users/{uid}/exports/{id}.zip` |
-| expires_at | timestamptz | presigned TTL 24 ч; объект удаляется через 48 ч после готовности |
+| expires_at | timestamptz | время жизни **артефакта** 24 ч (сами presigned-ссылки — TTL ≤ 15 мин, перезапрашиваются через эндпоинт статуса); объект S3 удаляется через 48 ч после готовности |
 | error | jsonb | |
 | created_at / finished_at | timestamptz | |
 
@@ -763,9 +776,10 @@ CREATE POLICY tenant_isolation ON profile_facts
 
 | Данные | Правило |
 |---|---|
-| Удаление пользователя (единая матрица) | `DELETE FROM users WHERE id=...` → каскад на все tenant-таблицы; затем компенсирующая задача (после коммита): ① файлы S3 `users/{id}/**`; ② LangGraph-чекпоинты его copilot_runs по списку thread_id; ③ `audit_events.actor_user_id → null` + `actor_alias=deleted_user:{id}` (журнал сохраняется — доказательство удаления); ④ Redis: ничего долговременного (link-коды и идемпотентность истекают по TTL ≤ 24 ч); ⑤ Langfuse-трейсы — best-effort (см. [SECURITY.md](SECURITY.md) §8) |
-| Экспорт данных | `POST /api/v1/users/me/export` → `data_exports` (статус → ready, presigned 24 ч, объект S3 удаляется через 48 ч; см. [API_SPEC.md](API_SPEC.md) §7) |
-| audit_events | retention 12 мес.; UPDATE/DELETE запрещены, кроме анонимизации при удалении пользователя |
+| Удаление пользователя (единая матрица) | `DELETE FROM users WHERE id=...` → каскад на все tenant-таблицы; затем компенсирующая задача (после коммита): ① файлы S3 `users/{id}/**`; ② LangGraph-чекпоинты его copilot_runs по списку thread_id; ③ `audit_subjects` — каскад уничтожает связь subject↔user (не выводимую обратно); сами `audit_events` **не изменяются** (append-only, §3.15) — сохраняется доказательство факта удаления без PII и исходных id; ④ Redis: ничего долговременного (link-коды и идемпотентность истекают по TTL ≤ 24 ч); ⑤ Langfuse-трейсы — best-effort (см. [SECURITY.md](SECURITY.md) §8) |
+| Экспорт данных | `POST /api/v1/users/me/export` → `data_exports` (статус → ready; **presigned-ссылка TTL ≤ 15 мин** — перезапрос через эндпоинт статуса; артефакт живёт 24 ч, объект S3 удаляется через 48 ч; см. [API_SPEC.md](API_SPEC.md) §7) |
+| audit_events | retention 12 мес.; UPDATE/DELETE запрещены **без исключений** (privacy-трансформация не нужна — модель `audit_subjects`, §3.15) |
+| audit_subjects | связь subject↔user уничтожается каскадом при удалении пользователя; отдельных retention-правил нет |
 | event_deliveries | purge старше 30 дней |
 | job_postings.raw_data | недоверенный контент; компакция (удаление raw) для closed/gone старше 3 мес.; нормализованные поля остаются |
 | jobs/job_versions | closed старше 6 мес. → сжатие до последней версии; старше 12 мес. → `archived`, удаление по политике. **12 мес. — provisional-политика** (не обязательство): пересматривается при первом реальном наполнении каталога вакансий |

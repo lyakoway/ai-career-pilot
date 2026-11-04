@@ -28,18 +28,20 @@
 
 **Refresh-токен** — **opaque** случайный 256-бит (`rt_` + 43 символа base64url; это НЕ JWT), хранится сервером как sha256-хеш, TTL 30 дней, ротация при каждом использовании. Реюз отозванного refresh → отзыв **всех** сессий пользователя (`401`, код `token_reuse_detected`).
 
-Транспорт refresh-токена (браузер): **httpOnly + Secure + SameSite=Lax cookie `cp_refresh`** — не доступен JS, что снимает риск кражи через XSS. Тело ответа содержит только `accessToken`. Не-браузерные клиенты (скрипты, тесты) могут передать refresh в теле `refreshToken`. Детали и статус решения — [ADR-020](DECISIONS.md) (Accepted, подтверждён 2026-11-04).
+Транспорт refresh-токена (браузер): **httpOnly + Secure + SameSite=Lax cookie `cp_refresh`** — cookie недоступна для чтения JavaScript (исключает чтение/вынос refresh-токена; активная XSS всё равно может действовать от имени пользователя в рамках сессии — компенсирующие меры в [SECURITY.md](SECURITY.md) §2). Тело ответа содержит только `accessToken`. Не-браузерные клиенты (скрипты, тесты) могут передать refresh в теле `refreshToken`. Детали и статус решения — [ADR-020](DECISIONS.md) (Accepted, подтверждён 2026-11-04).
 
 Хранение на frontend: access — только в памяти (Zustand-стор без персистентности); refresh — cookie (см. выше); **никогда** — localStorage/sessionStorage.
 
-CSRF (cookie-аутентифицированные операции `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — несовпадение или отсутствие обоих заголовков → `403` (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
+CSRF (cookie-аутентифицированные операции `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — точное сравнение; несовпадение или отсутствие обоих заголовков → `403` (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
+
+**Конкурентная ротация refresh:** атомарный claim — `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL` в транзакции. Победивший запрос получает новую пару; конкурентный запрос с тем же токеном (UPDATE затронул 0 строк) трактуется как **reuse** → `401 token_reuse_detected` + отзыв всех сессий. Grace period отсутствует. Клиентский контракт: single-flight refresh в пределах вкладки **и межвкладочно** (Web Locks API / fallback BroadcastChannel); при неизвестном результате (таймаут/обрыв) — один повтор; полученный `token_reuse_detected` = истёкшая сессия → переход на логин (fail-safe). Полная семантика — [SECURITY.md](SECURITY.md) §2; acceptance criteria — [EVALUATION.md](EVALUATION.md) §2.
 
 Матрица авторизации эндпоинтов:
 
 | Категория | Эндпоинты | Требуется |
 |---|---|---|
 | Public | `POST /auth/register`*, `POST /auth/login`, `POST /auth/refresh` (refresh-токен), `GET /health`, `GET /ready` | ничего / refresh-токен для refresh |
-| Access JWT | все остальные, включая `POST /auth/logout` (refresh в теле) и `PUT /auth/password` | `Authorization: Bearer` |
+| Access JWT | все остальные, включая `PUT /auth/password`; `POST /auth/logout` — access JWT **либо** валидная refresh-cookie с пройденной Origin-проверкой | `Authorization: Bearer` |
 
 \* `POST /auth/register` публичен **только в SaaS-фазе**; в personal MVP регистрация закрыта флагом `CP_ALLOW_REGISTRATION=false` → `403` `registration_disabled` (см. [SECURITY.md](SECURITY.md) §12, ADR-021).
 
@@ -77,7 +79,7 @@ CSRF (cookie-аутентифицированные операции `refresh`/`
 | POST | `/auth/register` | public* | регистрация email+пароль (в MVP отключена, §1.1) |
 | POST | `/auth/login` | public | вход → access + refresh-cookie |
 | POST | `/auth/refresh` | refresh | ротация refresh (cookie или тело) |
-| POST | `/auth/logout` | access | отзыв refresh-сессии (refresh из cookie или тела) |
+| POST | `/auth/logout` | access или refresh-cookie (+Origin) | отзыв refresh-сессии (refresh из cookie или тела); при доступе только по refresh-cookie (истёкший access) операция ограничена отзывом этой сессии |
 | PUT | `/auth/password` | access | смена пароля (старый + новый) |
 | GET | `/users/me` | access | профиль пользователя |
 | PATCH | `/users/me` | access | locale, timezone, displayName |
@@ -394,7 +396,7 @@ GET /api/v1/documents/{id}/export/{exportId}      → 200 { "status": "ready", "
 
 ```json
 { "exportId": "0192f000-...", "status": "processing",
-  "note": "Статус и ссылка — GET /users/me/export/{exportId} (готовый архив, presigned URL, TTL 24 ч)" }
+  "note": "Статус и ссылка — GET /users/me/export/{exportId} (готовый архив; presigned URL TTL ≤ 15 мин, новую ссылку можно перезапросить; артефакт доступен 24 ч)" }
 ```
 
 ### 7.4 Application State Machine

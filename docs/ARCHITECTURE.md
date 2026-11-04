@@ -339,7 +339,7 @@ AppError (base; code, http_status, user_message, details)
 
 - Локально: `.env` (не коммитится; пример — `.env.example`).
 - Docker Compose: secrets через environment/.env файла compose; production: environment провайдера облака; опции на будущее — SOPS/Infisical (ADR-013).
-- Никаких секретов в коде/образах/логах; токены источников и Telegram хранятся в БД **зашифрованными** (pgcrypto/envelope-шифрование, ключ из env — см. [SECURITY.md](SECURITY.md) §5).
+- Никаких секретов в коде/образах/логах; пользовательские credentials источников — application-level AES-256-GCM в БД (формат `{key_id, nonce, ciphertext}`, ключ из env); Telegram bot token и мастер-ключ шифрования — секреты деплоя в environment (в БД не хранятся); см. [SECURITY.md](SECURITY.md) §4 и ADR-013.
 - Ротация: refresh-токены короткоживущие, пароли — Argon2id; ротация ключа шифрования — runbook в Stage 8.
 
 ## 11. Топология деплоя (dev / single-node personal)
