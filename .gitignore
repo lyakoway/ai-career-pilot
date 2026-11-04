@@ -1,0 +1,38 @@
+# --- Secrets & local config ---
+.env
+.env.*
+!.env.example
+
+# --- Python (backend) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage*
+dist/
+build/
+*.egg-info/
+
+# --- Node (frontend) ---
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# --- Databases & storage artifacts ---
+*.sqlite3
+*.db
+docker/volumes/
+
+# --- IDE & OS ---
+.idea/
+.vscode/
+.DS_Store
+
+# --- Exports & logs ---
+*.log
+exports/
