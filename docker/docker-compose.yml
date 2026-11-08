@@ -1,0 +1,53 @@
+name: careerpilot
+
+# Stage 1 (STAGE_1_PLAN §11): api + db + redis.
+# Воркеры/beat/minio/pgvector-образ — профили Stage 2+ (не создаются заранее).
+
+services:
+  api:
+    build:
+      context: ../backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: ../backend/.env
+        required: false
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: careerpilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # S1.2: монтирование docker/db/bootstrap.sql (роли cp_app/cp_migrations) в
+      # /docker-entrypoint-initdb.d/ — добавляется вместе с ролями.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d careerpilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  pgdata:

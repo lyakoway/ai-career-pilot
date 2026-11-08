@@ -36,3 +36,4 @@ docker/volumes/
 # --- Exports & logs ---
 *.log
 exports/
+backend/openapi.run*.json

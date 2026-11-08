@@ -34,21 +34,21 @@ Stage 2 и Stage 3 можно вести параллельно после Stage
 **Статус:** завершён (этот набор документов).
 **Результат:** PRD, ARCHITECTURE, DATABASE, API_SPEC, AI_DESIGN, INTEGRATIONS, EVALUATION, SECURITY, ROADMAP, DECISIONS.
 
-## Stage 1 — Foundation
+## Stage 1 — Foundation (backend-only)
 
-**Цель:** работающий скелет системы: деплой, CI, аутентификация, базовые процессы разработки.
+**Цель:** работающий backend-скелет: деплой, CI, аутентификация, базовые процессы разработки. Детальный план — [STAGE_1_PLAN.md](STAGE_1_PLAN.md) (Accepted v1.2).
 
 Объём:
 
-- Монорепо: `backend/`, `frontend/` (каркас), `docker/`, `.github/workflows/`.
-- Docker Compose: api, worker-pipeline / worker-ai / worker-notify, beat (singleton), telegram-poller (появится к Stage 6), db (PG16+pgvector), redis, minio, frontend; профайл `langfuse` (опционально). Топология — [ARCHITECTURE.md §11](ARCHITECTURE.md).
-- `core`: pydantic-settings конфигурация, structlog-логирование с request_id, иерархия ошибок, middleware, /health /ready.
-- `identity`: users + refresh_tokens, Alembic initial migration, auth endpoints (register/login/refresh/logout/me).
-- `llm`: каркас LLMClient с мок-провайдером (реальный провайдер — Stage 2), маскирование, `ai_invocations` (схема+запись).
-- CI: lint (ruff/mypy), unit, integration (testcontainers), OpenAPI-генерация.
-- Фронтенд: каркас приложения (роутинг, auth-флоу, дизайн-система shadcn, i18n-структура ru/en).
+- Монорепо: `backend/`, `docker/`, `.github/workflows/` (frontend-каркас перенесён на Stage 2 — решение владельца Q-1).
+- Docker Compose: **api + db (`postgres:16`) + redis** (rate limiting auth; ключи HMAC). Воркеры/beat/minio/pgvector-образ — с этапов 2–4; топология-цель — [ARCHITECTURE.md §11](ARCHITECTURE.md).
+- `core`: pydantic-settings конфигурация (fail-fast; production-validation `CP_COOKIE_SECURE`), structlog-логирование с request_id и PII-редакцией, иерархия ошибок (ru/en), middleware, /health /ready.
+- `identity`: users + refresh_tokens + audit (`audit_subjects`/`audit_events`), Alembic initial migration, bootstrap ролей БД (`cp_app`/`cp_migrations` — инфраструктурный SQL, не Alembic), auth endpoints (register закрыт флагом / login / refresh-ротация / logout / password / me), owner provisioning.
+- Rate limiting auth (Redis, fail-closed 503 при недоступности).
+- CI (PR + push): ruff + mypy → миграции на чистой PG → тесты (вкл. конкурентность ротации, Redis-outage, config-validation) → детерминированный OpenAPI-артефакт → docker build.
+- **Перенесено на Stage 2 (решение Q-1):** frontend-каркас (роутинг, auth-флоу, shadcn, i18n), `llm`-каркас с мок-провайдером и `ai_invocations`.
 
-**Критерии выхода:** `docker compose up` → регистрация/вход в UI; CI зелёный на всех коммитах; OpenAPI-схема публикуется артефактом; логи JSON с request_id.
+**Критерии выхода:** `docker compose up` → api/db/redis здоровы; владелец создаётся provisioning-скриптом; `/auth/register` → `403 registration_disabled`; конкурентные AC ротации ①–⑧ зелёные; CI зелёный на всех коммитах; OpenAPI-артефакт воспроизводим; логи JSON с request_id без PII. (Прежний критерий «регистрация/вход в UI» снят — UI в Stage 1 нет.)
 
 ## Stage 2 — Resume Intelligence + Career Profile
 
@@ -56,6 +56,7 @@ Stage 2 и Stage 3 можно вести параллельно после Stage
 
 Объём:
 
+- Перенесено из Stage 1 (решение Q-1): frontend-каркас приложения (роутинг, auth-флоу с single-flight refresh и Web Locks, shadcn, i18n ru/en); `llm`-каркас (LLMClient-мок, маскирование, `ai_invocations`); MinIO в compose — при появлении файловых задач.
 - Загрузка файлов (S3, приватность, лимиты), статусы парсинга.
 - Пайплайн Profile Analyzer ([AI_DESIGN §3](AI_DESIGN.md)): детерминированное извлечение текста, LLM-извлечение фактов, evidence binding, нормализация навыков (seed-справочник).
 - UI обзора/подтверждения фактов; ручное добавление; редактирование с версионированием (superseded).

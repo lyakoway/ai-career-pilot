@@ -1,6 +1,6 @@
 # CareerPilot AI — Stage 1 Implementation Plan (Backend Foundation)
 
-- **Статус:** Draft v1.1 — обновлён по ревью владельца (решения Q-1…Q-8 внесены); реализация не начата, ожидаю финального утверждения.
+- **Статус:** **Accepted v1.2** — утверждён владельцем (R-1 APPROVED); уточнения ревью v1.2: AC ⑦ (rollback-инвариант), роли БД через инфраструктурный bootstrap, HMAC-ключи rate-limit; правки §15.2 применены к SECURITY/API_SPEC (R-2 APPROVED), ROADMAP синхронизирован. Реализация: S1.0.
 - **База:** коммит `35f0883` (Stage 0.2). План сверён с фактическим содержимым ARCHITECTURE, SECURITY, DATABASE, API_SPEC, DECISIONS, EVALUATION, INTEGRATIONS, ROADMAP.
 - **Ограничения учтены:** без кода на этапе планирования; без Celery/LangGraph/Langfuse; без микросервисов/K8s/Kafka/ES; без ослабления security-контрактов; без grace period; refresh не в localStorage; без push/коммитов до подтверждения.
 
@@ -54,7 +54,7 @@ ai-career-pilot/
 │   │   │   ├── errors.py              # AppError-иерархия + handlers → единый формат
 │   │   │   ├── i18n.py                # каталог сообщений ru/en по кодам ошибок
 │   │   │   ├── middleware.py          # RequestID, access-log, security headers
-│   │   │   ├── ratelimit.py           # Redis: fixed-window per-IP/per-account (ключи sha256), 429+Retry-After, fail-closed
+│   │   │   ├── ratelimit.py           # Redis: fixed-window per-IP/per-account (ключи HMAC-SHA256), 429+Retry-After, fail-closed
 │   │   │   └── security/
 │   │   │       ├── jwt.py             # HS256 encode/decode (sub/iat/exp/jti/locale)
 │   │   │       ├── passwords.py       # argon2-cffi (m=19MiB,t=2,p=1), политика 10–128 + denylist
@@ -124,7 +124,7 @@ models (models.py)              → SQLAlchemy-таблицы модуля
 
 ### 4.3 Конфигурация
 
-`CP_`-переменные (частичный список, полный — в `.env.example`): `CP_APP_ENV`, `CP_DATABASE_URL`, `CP_REDIS_URL`, `CP_JWT_SECRET` (≥32 байт, fail-fast), `CP_ACCESS_TTL_SECONDS=900`, `CP_REFRESH_TTL_DAYS=30`, `CP_ALLOW_REGISTRATION=false`, `CP_ALLOWED_ORIGIN`, `CP_COOKIE_SECURE=true`, `CP_RATE_LIMIT_*` (окна/лимиты), `CP_LOG_LEVEL`, `CP_LOG_FORMAT=json|console`. Неизвестные переменные с префиксом `CP_` и невалидные значения → отказ старта (ARCHITECTURE §9). **Startup validation (Q-5):** `CP_COOKIE_SECURE=false` допускается только при `CP_APP_ENV=local`; сочетание `production` + `false` — отказ старта (тест S1.1).
+`CP_`-переменные (частичный список, полный — в `.env.example`): `CP_APP_ENV`, `CP_DATABASE_URL`, `CP_REDIS_URL`, `CP_JWT_SECRET` (≥32 байт, fail-fast), `CP_ACCESS_TTL_SECONDS=900`, `CP_REFRESH_TTL_DAYS=30`, `CP_ALLOW_REGISTRATION=false`, `CP_ALLOWED_ORIGIN`, `CP_COOKIE_SECURE=true`, `CP_RATELIMIT_HMAC_KEY` (≥32 байт; ревью v1.2 — HMAC для ключей лимитов), `CP_RATE_LIMIT_*` (окна/лимиты), `CP_LOG_LEVEL`, `CP_LOG_FORMAT=json|console`. Неизвестные переменные с префиксом `CP_` и невалидные значения → отказ старта (ARCHITECTURE §9). **Startup validation (Q-5):** `CP_COOKIE_SECURE=false` допускается только при `CP_APP_ENV=local`; сочетание `production` + `false` — отказ старта (тест S1.1).
 
 ### 4.4 Логирование
 
@@ -148,7 +148,7 @@ structlog; JSON в проде, pretty в dev. Процессоры: requestId (�
 | `core/db.py` | Async-engine, session-factory, `Base` с naming convention (DATABASE §1: `idx_`, `uq_`, `fk_`, `pk_`; snake_case, множественное число) |
 | `core/errors.py` + `i18n.py` | Иерархия, маппинг → HTTP, каталог локализованных сообщений |
 | `core/middleware.py` | RequestID, access-log (метод/путь/статус/длительность, без тел), security headers |
-| `core/ratelimit.py` | Redis fixed-window per-IP/per-account, ключи через sha256 (email/IP в открытом виде не хранятся); enforcement — `429` + `Retry-After`; fail-closed при недоступности Redis; детальная спецификация — §9.3 |
+| `core/ratelimit.py` | Redis fixed-window per-IP/per-account, ключи через HMAC-SHA256 с секретом `CP_RATELIMIT_HMAC_KEY` (email/IP в открытом виде не хранятся); enforcement — `429` + `Retry-After`; fail-closed при недоступности Redis; детальная спецификация — §9.3 |
 | `core/security/jwt.py` | Выпуск/проверка access-JWT (HS256, claims `sub/iat/exp/jti/locale`, TTL 900 c) |
 | `core/security/passwords.py` | Argon2id (m=19 MiB, t=2, p=1), длина 10–128, denylist частых паролей |
 | `core/security/cookies.py` | `cp_refresh`: HttpOnly, Secure (флаг), SameSite=Lax, Path=`/api/v1/auth`; сеттер/парсер |
@@ -179,7 +179,7 @@ structlog; JSON в проде, pretty в dev. Процессоры: requestId (�
 ### S1.2 — БД и миграции
 
 - **Цель:** схема identity по DATABASE §3.1/§3.15.
-- **Задачи:** `core/db.py` (async engine/session/Base+naming), `models.py` (4 таблицы, citext email, uuid7 через `uuid6`), Alembic env (async) + `0001_initial`; в миграции — `CREATE EXTENSION IF NOT EXISTS citext` (downgrade: drop таблиц → `DROP EXTENSION IF EXISTS citext`, зависимых объектов нет); права: миграция создаёт роль приложения и выдаёт ей DML на доменные таблицы, но на `audit_events` — только `SELECT`/`INSERT` (`REVOKE UPDATE, DELETE`); каскадное удаление `users` → `refresh_tokens`/`audit_subjects` удаляются, `audit_events` **остаются** (FK-семантика DATABASE §3.15: `actor_subject_id` — plain uuid без FK, осиротевшие subject_id — норма).
+- **Задачи:** `core/db.py` (async engine/session/Base+naming), `models.py` (4 таблицы, citext email, uuid7 через `uuid6`), Alembic env (async) + `0001_initial`; в миграции — `CREATE EXTENSION IF NOT EXISTS citext` (downgrade: drop таблиц → `DROP EXTENSION IF EXISTS citext`, зависимых объектов нет); `docker/db/bootstrap.sql` — идемпотентное создание ролей `cp_app`/`cp_migrations` (инфраструктурный уровень, не Alembic — ревью v1.2); в миграции — **GRANT** для `cp_app`: DML на доменные таблицы, на `audit_events` только `SELECT`/`INSERT`; каскадное удаление `users` → `refresh_tokens`/`audit_subjects` удаляются, `audit_events` **остаются** (FK-семантика DATABASE §3.15: `actor_subject_id` — plain uuid без FK, осиротевшие subject_id — норма).
 - **Тесты (integration):** upgrade head на чистой PG; downgrade base (включая безопасное удаление citext); объекты/индексы соответствуют DATABASE (проверка по information_schema); повторный `upgrade` идемпотентен; **роль приложения не имеет UPDATE/DELETE на `audit_events`** (проверка `has_table_privilege`); **удаление пользователя сохраняет `audit_events`** (каскад-тест).
 - **Готово:** миграция поднимается/откатывается на чистой базе; naming conventions соблюдены.
 
@@ -201,7 +201,7 @@ structlog; JSON в проде, pretty в dev. Процессоры: requestId (�
 
 - **Цель:** контракты ротации/CSRF/logout без ослаблений.
 - **Задачи:** `/auth/refresh` (режимы и Origin-guard по §9.1 — решение Q-2; атомарный claim; классификация: expired → 401 `unauthorized`, revoked → reuse → массовый отзыв + audit + 401 `token_reuse_detected`); `/auth/logout` (access-JWT-режим и cookie-режим с ограничением операции).
-- **Тесты (integration, acceptance criteria = EVALUATION §2 + ревью владельца):** ① два конкурентных запроса одним токеном: победитель 200+новая пара, проигравший 401 `token_reuse_detected` + все сессии отозваны; ② инвариант ≤1 действующего токена в семье (проверка после гонок и в спокойном цикле); ③ повторное использование ротированного токена → массовый отзыв; ④ logout по refresh-cookie при истёкшем access отзывает сессию; ⑤ **две конкурентные PostgreSQL-транзакции на уровне SQL** (не только HTTP): победитель коммитит ротацию, проигравший видит 0 строк → классифицируется как reuse; ⑥ **атомарность массового отзыва** — одна транзакция «ревок всех активных токенов + audit `refresh.reuse_detected`», частично отозванных состояний не бывает; ⑦ **отсутствие частично выпущенных refresh-токенов после rollback проигравшего** — в БД ровно один действующий токен; ⑧ audit при reuse корректен (событие в транзакции отзыва, subject через audit_subjects); дополнительно: expired-токен ≠ reuse (нет массового отзыва), Origin mismatch/отсутствие (в cookie-режиме) → 403, **неоднозначный запрос (cookie+тело) → cookie-режим с Origin-guard, тело игнорируется**, cookie-атрибуты соответствуют ADR-020, ротация обновляет cookie.
+- **Тесты (integration, acceptance criteria = EVALUATION §2 + ревью владельца):** ① два конкурентных запроса одним токеном: победитель 200+новая пара, проигравший 401 `token_reuse_detected` + все сессии отозваны; ② инвариант ≤1 действующего токена в семье (проверка после гонок и в спокойном цикле); ③ повторное использование ротированного токена → массовый отзыв; ④ logout по refresh-cookie при истёкшем access отзывает сессию; ⑤ **две конкурентные PostgreSQL-транзакции на уровне SQL** (не только HTTP): победитель коммитит ротацию, проигравший видит 0 строк → классифицируется как reuse; ⑥ **атомарность массового отзыва** — одна транзакция «ревок всех активных токенов + audit `refresh.reuse_detected`», частично отозванных состояний не бывает; ⑦ **rollback-инвариант проигравшего**: проигравший **никогда не выпускает** новый refresh-токен (его транзакция — только массовый отзыв + audit); при commit отзыв и audit фиксируются одной транзакцией → после commit **активных сессий пользователя 0** (включая только что выданный токен победителя — это fail-safe сторона AC ①: клиент при `token_reuse_detected` перелогинивается); при rollback (инжектированный сбой) **не остаётся ничего частичного** — ни отозванных сессий, ни audit-события, ни нового refresh-токена: состояние БД равно состоянию до транзакции проигравшего (действующий — только токен победителя); ⑧ audit при reuse корректен (событие в транзакции отзыва, subject через audit_subjects); дополнительно: expired-токен ≠ reuse (нет массового отзыва), Origin mismatch/отсутствие (в cookie-режиме) → 403, **неоднозначный запрос (cookie+тело) → cookie-режим с Origin-guard, тело игнорируется**, cookie-атрибуты соответствуют ADR-020, ротация обновляет cookie.
 - **Готово:** все AC зелёные; конкурентность проверена и на уровне БД (две параллельные транзакции claim).
 
 ### S1.6 — CI-финализация и документация
@@ -240,7 +240,7 @@ Alembic — единственный источник схемы; async env; и�
 
 - **citext:** upgrade — `CREATE EXTENSION IF NOT EXISTS citext`; downgrade — drop 4 таблиц → `DROP EXTENSION IF EXISTS citext` (зависимых объектов не остаётся; в dev/testcontainers база одноразовая; в shared-инстансах расширение общее — удаляем только если создали мы, что гарантирует порядок операций downgrade).
 - **`audit_events.actor_subject_id`** — plain uuid **без FK** (DATABASE §3.15): FK заблокировал бы удаление связи или мутировал бы append-only события; каскад удаления пользователя затрагивает только `audit_subjects`/`refresh_tokens`, `audit_events` **сохраняются** (осиротевшие subject_id — норма; тест S1.2).
-- **Права роли приложения:** миграция создаёт роль (имя из `CP_DB_APP_ROLE`, default `cp_app`) с DML на доменные таблицы; на `audit_events` — только `SELECT`/`INSERT` (`REVOKE UPDATE, DELETE`); приложение подключается под этой ролью (compose/dev тоже). Каскадные удаления с `users` срабатывают от привилегии на родительскую таблицу — REVOKE не мешает.
+- **Роли и права (по ревью v1.2):** создание ролей вынесено **из Alembic в инфраструктурный bootstrap** — идемпотентный `docker/db/bootstrap.sql` (монтируется в initdb контейнера Postgres; тот же скрипт выполняется в CI перед миграциями): создаёт `cp_app` (runtime, LOGIN, ограниченная) и `cp_migrations` (миграции, DDL). Миграции выполняются под `cp_migrations` и содержат **схему + GRANT** для `cp_app`: DML на доменные таблицы, на `audit_events` — только `SELECT`/`INSERT` (`REVOKE UPDATE, DELETE`); runtime-приложение подключается под `cp_app` (в т.ч. compose/dev). Каскадные удаления с `users` срабатывают от привилегии на родительскую таблицу — REVOKE не мешает.
 - **Образ БД (Q-7):** `postgres:16` (plain). pgvector-образ и расширение появятся на Stage 3–4 вместе с векторным поиском; dev-volume пересоздаётся (данных для сохранения нет).
 - Индексы/ограничения — в точности §8.1/DATABASE §3.1, §3.15 (проверка тестом по information_schema/pg_catalog).
 
@@ -281,7 +281,7 @@ Alembic — единственный источник схемы; async env; и�
 
 ### 9.3 Rate limiting (детализация по ревью)
 
-- **Ключи Redis** (без PII в открытом виде — только sha256): per-IP `cp:rl:auth:ip:{sha256(ip)}` (все auth-эндпоинты, окно 60 c, лимит-гипотеза 30) и `cp:rl:login:ip:{sha256(ip)}` (login, окно 60 c, лимит 10); per-account `cp:rl:acc:{sha256(email_lower)}` — счётчик **неудачных** логинов, TTL 900 c, порог-гипотеза 10 → `429` c `Retry-After` = остаток TTL.
+- **Ключи Redis** (без PII в открытом виде — **HMAC-SHA256 с отдельным серверным секретом** `CP_RATELIMIT_HMAC_KEY` ≥32 байт из env, production — fail-fast без дефолта; ревью v1.2: plain sha256(email) восстанавливается перебором пространства email — HMAC с секретом исключает; security-документам не противоречит — SECURITY §2 требует лишь throttle в Redis): per-IP `cp:rl:auth:ip:{hmac(ip)}` (все auth-эндпоинты, окно 60 c, лимит-гипотеза 30) и `cp:rl:login:ip:{hmac(ip)}` (login, окно 60 c, лимит 10); per-account `cp:rl:acc:{hmac(email_lower)}` — счётчик **неудачных** логинов, TTL 900 c, порог-гипотеза 10 → `429` c `Retry-After` = остаток TTL. Ротация ключа обнуляет счётчики (принято).
 - **Сброс:** успешный логин → `DEL cp:rl:acc:{…}`; IP-окна истекают по TTL.
 - **Защита от намеренного lockout:** per-account порог мягкий и автоистекающий (нет вечной блокировки жертвы, нет ручного разблокирования); брутфорс по одному аккаунту ограничен per-account ключом, массовый — per-IP; остаточный риск (ротация IP против одного аккаунта) принят и зафиксирован.
 - **Enforcement:** основной механизм — `429` + `Retry-After`; длительные `asyncio.sleep` блокировкой **не являются и не используются**; допустим только микро-jitter ≤ 250 мс как анти-молотилка.
@@ -300,7 +300,7 @@ Alembic — единственный источник схемы; async env; и�
 | API integration | register 403/201(флаг), login 200/401/429, me, password change + ревок сессий, готовность /ready |
 | PostgreSQL integration | репозитории на реальной PG; claim-транзакция; FK-каскады (удаление пользователя → refresh_tokens/audit_subjects каскадом, audit_events остаются, subject осиротевший — ожидаемо) |
 | Migration | upgrade/downgrade чистой базы; naming conventions; objects == DATABASE §8.1 |
-| Refresh rotation concurrency | AC ①–⑧ из S1.5 (вкл. две конкурентные PG-транзакции, атомарность массового отзыва, отсутствие частично выпущенных токенов после rollback, корректный audit при reuse) + expired≠reuse |
+| Refresh rotation concurrency | AC ①–⑧ из S1.5 (вкл. две конкурентные PG-транзакции, атомарность массового отзыва, rollback-инвариант: проигравший не выпускает токен, rollback не оставляет частичного отзыва/audit/нового токена, после commit reuse — 0 активных сессий, корректный audit при reuse) + expired≠reuse |
 | CSRF | cookie-режим refresh/logout: Origin неверный → 403; Referer-fallback; body-режим — по решению Q-2 |
 | Tenant isolation | 2 пользователя: me/свои токены/чужие id → 404; cookie A не работает как B |
 | Rate limiting | 429 per-IP и per-account с `Retry-After`; успешный логин сбрасывает per-account счётчик; счётчики атомарны при конкурентных запросах; **Redis outage → 503 fail-closed** (лимиты не отключаются молча), `/ready` → 503 |
@@ -383,9 +383,9 @@ S1.1 и S1.2 параллелизуемы; S1.5 требует и S1.4, и origi
 
 | # | Вопрос | Что нужно |
 |---|---|---|
-| R-1 | Финальное утверждение обновлённого плана | Подтверждение владельца → статус плана Accepted, старт S1.0 |
-| R-2 | Согласование документальных правок Q-2 (§15.2) | Одобрение diff → применяются в первом коммите Stage 1 вместе с ROADMAP-правками (D-1…D-3) |
-| R-3 | Значения-гипотезы rate-limit (30/мин auth, 10/мин login, 10 неудач/15 мин) | Не блокируют старт; калибруются при эксплуатации |
+| R-1 | Финальное утверждение обновлённого плана | **APPROVED (владелец)** — план Accepted v1.2, S1.0 запущен |
+| R-2 | Согласование документальных правок Q-2 (§15.2) | **APPROVED (владелец)** — diff применён к SECURITY.md/API_SPEC.md; ROADMAP синхронизирован (перенос D-1…D-3) |
+| R-3 | Значения-гипотезы rate-limit (30/мин auth, 10/мин login, 10 неудач/15 мин) | Не блокируют; калибруются при эксплуатации |
 
 ### 15.2 Документальные изменения на согласование (Q-2) — точный diff
 
@@ -403,13 +403,13 @@ S1.1 и S1.2 параллелизуемы; S1.5 требует и S1.4, и origi
 + CSRF (cookie-режим `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — точное сравнение; несовпадение или отсутствие обоих заголовков → `403`. Guard применяется только в cookie-режиме; body-режим (`refreshToken` в теле, cookie отсутствует) — без Origin-проверки; при наличии обоих источников cookie имеет приоритет, тело игнорируется (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
 ```
 
-Оба изменения не ослабляют защиту (cookie-режим полностью сохраняет guard; приоритет cookie закрывает обход через подстановку тела) и не требуют новых ADR — это уточнение реализации решения ADR-020. **Пока не применены** — ожидают согласования вместе с планом.
+Оба изменения не ослабляют защиту (cookie-режим полностью сохраняет guard; приоритет cookie закрывает обход через подстановку тела) и не требуют новых ADR — это уточнение реализации решения ADR-020. **Применены (R-2 APPROVED):** внесены в SECURITY.md §2 и API_SPEC.md §1.1; ROADMAP синхронизирован. Коммит — по подтверждению владельца вместе с S1.0.
 
 ## 16. Само-аудит плана (соответствие ограничениям)
 
 - ADR не меняются: архитектура (monolith — ADR-001), стек (ADR-002), токены (ADR-020 — реализация, не пересмотр), secrets env-first (ADR-013), uuid6 (ADR-016), режимы MVP (ADR-021). ✅
 - **Решения владельца Q-1…Q-8 внесены во все разделы плана** (§2.3, §4.3, §8.2, §9.1–9.3, §11–§13); ничего не принято молча. ✅
-- Security-контракты не ослаблены: ротация без grace period, refresh не в localStorage (cookie — сторона backend), reuse → массовый отзыв, CSRF guard cookie-режима (приоритет cookie при неоднозначности), rate limiting fail-closed, PII-редакция. Уточнение Q-2 оформлено как diff на согласование (§15.2) и к SECURITY/API_SPEC **не применено**. ✅
+- Security-контракты не ослаблены: ротация без grace period, refresh не в localStorage (cookie — сторона backend), reuse → массовый отзыв, CSRF guard cookie-режима (приоритет cookie при неоднозначности), rate limiting fail-closed (ключи HMAC), PII-редакция. Уточнение Q-2 применено к SECURITY/API_SPEC (R-2 APPROVED); уточнения v1.2 (AC ⑦, роли-в-bootstrap, HMAC) согласованы владельцем. ✅
 - Функции будущих этапов не протекают: нет Celery/LangGraph/Langfuse/llm/S3/RLS/export; `data_exports` не создаётся. Отклонения от ROADMAP (D-1…D-3) одобрены владельцем; ROADMAP обновляется первым коммитом Stage 1. ✅
 - Лишние зависимости отсутствуют: минимальный набор (fastapi, sqlalchemy, asyncpg, alembic, pydantic-settings, structlog, argon2-cffi, pyjwt, uuid6, redis, httpx/pytest/testcontainers — dev); образ БД — plain `postgres:16` (Q-7). ✅
 - План декомпозирован на малые подэтапы S1.0–S1.6 (каждый — небольшие коммиты) с зелёным CI после каждого. ✅

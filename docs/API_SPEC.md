@@ -32,7 +32,7 @@
 
 Хранение на frontend: access — только в памяти (Zustand-стор без персистентности); refresh — cookie (см. выше); **никогда** — localStorage/sessionStorage.
 
-CSRF (cookie-аутентифицированные операции `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — точное сравнение; несовпадение или отсутствие обоих заголовков → `403` (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
+CSRF (cookie-режим `refresh`/`logout`): `SameSite=Lax` + **валидация `Origin`** (fallback `Referer`) против разрешённого origin — точное сравнение; несовпадение или отсутствие обоих заголовков → `403`. Guard применяется только в cookie-режиме; body-режим (`refreshToken` в теле, cookie отсутствует) — без Origin-проверки; при наличии обоих источников cookie имеет приоритет, тело игнорируется (детали — [ADR-020](DECISIONS.md), [SECURITY.md](SECURITY.md) §2).
 
 **Конкурентная ротация refresh:** атомарный claim — `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL` в транзакции. Победивший запрос получает новую пару; конкурентный запрос с тем же токеном (UPDATE затронул 0 строк) трактуется как **reuse** → `401 token_reuse_detected` + отзыв всех сессий. Grace period отсутствует. Клиентский контракт: single-flight refresh в пределах вкладки **и межвкладочно** (Web Locks API / fallback BroadcastChannel); при неизвестном результате (таймаут/обрыв) — один повтор; полученный `token_reuse_detected` = истёкшая сессия → переход на логин (fail-safe). Полная семантика — [SECURITY.md](SECURITY.md) §2; acceptance criteria — [EVALUATION.md](EVALUATION.md) §2.
 
