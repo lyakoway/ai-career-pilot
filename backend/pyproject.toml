@@ -6,6 +6,14 @@ requires-python = ">=3.12,<4.0"
 dependencies = [
     "fastapi>=0.115,<1.0",
     "uvicorn[standard]>=0.32,<1.0",
+    "pydantic-settings>=2.6,<3.0",
+    "structlog>=24.4,<26.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
+    "asyncpg>=0.30,<1.0",
+    "redis>=5.2,<7.0",
+    "alembic>=1.14,<2.0",
+    "argon2-cffi>=23.1,<25.0",
+    "uuid6>=2024.7,<2027.0",
 ]
 
 [dependency-groups]
@@ -13,7 +21,9 @@ dev = [
     "httpx>=0.28,<1.0",
     "mypy>=1.13,<2.0",
     "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<2.0",
     "ruff>=0.8,<1.0",
+    "testcontainers[postgres]>=4.10,<5.0",
 ]
 
 [tool.uv]
@@ -25,13 +35,17 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+# RUF001-003: кириллица в строках/докстрингах — норма для русскоязычного проекта.
+ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"
 files = ["app"]
 strict = true
+plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
 addopts = "-q"

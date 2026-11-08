@@ -37,3 +37,4 @@ docker/volumes/
 *.log
 exports/
 backend/openapi.run*.json
+backend/.testpg/

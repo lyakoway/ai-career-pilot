@@ -29,8 +29,9 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # S1.2: монтирование docker/db/bootstrap.sql (роли cp_app/cp_migrations) в
-      # /docker-entrypoint-initdb.d/ — добавляется вместе с ролями.
+      # Bootstrap ролей cp_app/cp_migrations (STAGE_1_PLAN §8.2): выполняется
+      # суперпользователем при первом создании тома (initdb).
+      - ../backend/docker/db/bootstrap.sql:/docker-entrypoint-initdb.d/01_bootstrap.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d careerpilot"]
       interval: 5s

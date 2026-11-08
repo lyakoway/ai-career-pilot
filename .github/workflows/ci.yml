@@ -24,6 +24,41 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    # Обязательные CP_* переменные: конфигурация fail-fast валидируется при старте приложения
+    env:
+      CP_APP_ENV: local
+      CP_DATABASE_URL: postgresql+asyncpg://cp_app:cp_app@localhost:5432/careerpilot_ci
+      CP_MIGRATIONS_DATABASE_URL: postgresql+asyncpg://cp_migrations:cp_migrations@localhost:5432/careerpilot_ci
+      CP_REDIS_URL: redis://localhost:6379/0
+      CP_JWT_SECRET: ci-placeholder-jwt-secret-0123456789abcdef
+      CP_RATELIMIT_HMAC_KEY: ci-placeholder-hmac-key-0123456789abcdef
+      CP_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/careerpilot_test
+      CP_TEST_APP_DATABASE_URL: postgresql+asyncpg://cp_app:cp_app@localhost:5432/careerpilot_test
+      CP_TEST_MIGRATIONS_DATABASE_URL: postgresql+asyncpg://cp_migrations:cp_migrations@localhost:5432/careerpilot_test
+      PGPASSWORD: postgres
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: careerpilot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
     defaults:
       run:
         working-directory: backend
@@ -34,11 +69,26 @@ jobs:
           enable-cache: true
           working-directory: backend
       - run: uv sync --frozen
-      # S1.2: добавить services postgres:16/redis:7 и `alembic upgrade head` перед pytest.
+      - name: Bootstrap DB roles (cp_app / cp_migrations) on target databases
+        run: |
+          psql "postgresql://postgres:postgres@localhost:5432/postgres" -c "CREATE DATABASE careerpilot_migrate"
+          for db in careerpilot_test careerpilot_migrate; do
+            psql "postgresql://postgres:postgres@localhost:5432/$db" -f docker/db/bootstrap.sql
+          done
+      - name: Migrations smoke on clean database (upgrade head -> downgrade base)
+        run: |
+          CP_MIGRATIONS_DATABASE_URL=postgresql+asyncpg://cp_migrations:cp_migrations@localhost:5432/careerpilot_migrate uv run alembic upgrade head
+          CP_MIGRATIONS_DATABASE_URL=postgresql+asyncpg://cp_migrations:cp_migrations@localhost:5432/careerpilot_migrate uv run alembic downgrade base
       - run: uv run pytest
 
   openapi:
     runs-on: ubuntu-latest
+    env:
+      CP_APP_ENV: local
+      CP_DATABASE_URL: postgresql+asyncpg://cp_app:cp_app@localhost:5432/careerpilot_ci
+      CP_REDIS_URL: redis://localhost:6379/0
+      CP_JWT_SECRET: ci-placeholder-jwt-secret-0123456789abcdef
+      CP_RATELIMIT_HMAC_KEY: ci-placeholder-hmac-key-0123456789abcdef
     defaults:
       run:
         working-directory: backend
