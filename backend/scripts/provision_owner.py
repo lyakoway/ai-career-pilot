@@ -1,7 +1,10 @@
 """CLI создания владельца (personal MVP; SECURITY §12, ADR-021).
 
 Идемпотентен по email: существующий email -> отказ с диагностикой (exit 1).
+Пароль проходит политику (10–128 + denylist); нарушение -> exit 2.
 Пишет audit user.provisioned (context без секретов/PII). К API не подключён.
+Работает независимо от CP_ALLOW_REGISTRATION: provisioning владельца —
+не публичная регистрация (SECURITY §12).
 
 Использование (из backend/):
     uv run python scripts/provision_owner.py --email owner@example.com --password '...'
@@ -18,11 +21,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.config import get_settings
 from app.core.db import create_db_engine, create_session_factory
 from app.core.logging import configure_logging
-from app.core.security.passwords import hash_password
+from app.core.security.passwords import PasswordPolicyError, hash_password, validate_password
 from app.modules.identity import repository
 
 
 async def provision(email: str, password: str) -> int:
+    try:
+        validate_password(password)
+    except PasswordPolicyError as exc:
+        print(f"ОШИБКА: политика пароля: {exc}")
+        return 2
+
     settings = get_settings()
     configure_logging(settings)
     engine = create_db_engine(settings.database_url)

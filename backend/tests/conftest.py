@@ -6,6 +6,10 @@ module-level setdefault, чтобы create_app() -> get_settings() прошёл 
 Интеграционные PG-тесты: источник базы — env CP_TEST_DATABASE_URL (админ)
 или testcontainers (если доступен Docker); иначе — skip с пояснением.
 SQLite не используется нигде (STAGE_1_PLAN §10).
+
+Локальный кластер для прогонов (без Docker): backend/.testpg на порту 5434
+(CP_TEST_DATABASE_URL=postgresql://postgres@127.0.0.1:5434/careerpilot_test);
+5433 не занимать — используется соседним проектом.
 """
 
 import asyncio

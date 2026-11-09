@@ -13,6 +13,7 @@ dependencies = [
     "redis>=5.2,<7.0",
     "alembic>=1.14,<2.0",
     "argon2-cffi>=23.1,<25.0",
+    "pyjwt>=2.10,<3.0",
     "uuid6>=2024.7,<2027.0",
 ]
 
