@@ -20,15 +20,24 @@ from app.modules.identity.models import AuditSubject, RefreshToken, User
 __all__ = [
     "append_audit",
     "claim_refresh",
+    "create_refresh_session",
     "create_user",
     "get_user_by_email",
+    "get_user_by_id",
+    "revoke_all_except",
     "revoke_all_for_user",
+    "update_user",
 ]
 
 
 async def get_user_by_email(session: AsyncSession, email: str) -> User | None:
     """Пользователь по email (citext — сравнение без учёта регистра)."""
     result = await session.execute(select(User).where(User.email == email))
+    return result.scalar_one_or_none()
+
+
+async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
+    result = await session.execute(select(User).where(User.id == user_id))
     return result.scalar_one_or_none()
 
 
@@ -84,6 +93,54 @@ async def revoke_all_for_user(session: AsyncSession, user_id: uuid.UUID) -> int:
     )
     # rowcount есть только у DML-результатов; для UPDATE без RETURNING это число строк
     return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def create_refresh_session(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    token_hash: str,
+    expires_at: datetime,
+    ip: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    """Создать refresh-сессию (токен хранится только как sha256-хеш)."""
+    session.add(
+        RefreshToken(
+            user_id=user_id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+            ip=ip,
+            user_agent=user_agent,
+        )
+    )
+    await session.flush()
+
+
+async def revoke_all_except(
+    session: AsyncSession, user_id: uuid.UUID, keep_token_hash: str | None
+) -> int:
+    """Отозвать все активные сессии, кроме указанной (смена пароля, SECURITY §9.2)."""
+    statement = update(RefreshToken).where(
+        RefreshToken.user_id == user_id,
+        RefreshToken.revoked_at.is_(None),
+        RefreshToken.token_hash != keep_token_hash,
+    )
+    result = await session.execute(statement.values(revoked_at=datetime.now(UTC)))
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+async def update_user(session: AsyncSession, user: User, **changes: Any) -> User:
+    """Изменить поля пользователя (только переданные); flush без commit.
+
+    refresh обязателен: onupdate/server_default помечают атрибуты expired,
+    а ленивая догрузка в async-контексте невозможна (MissingGreenlet).
+    """
+    for field, value in changes.items():
+        setattr(user, field, value)
+    await session.flush()
+    await session.refresh(user)
+    return user
 
 
 async def get_or_create_subject(session: AsyncSession, user_id: uuid.UUID) -> uuid.UUID:

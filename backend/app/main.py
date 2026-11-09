@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import Settings, get_settings
-from app.core.db import create_db_engine
+from app.core.db import create_db_engine, create_session_factory
 from app.core.errors import AppError
 from app.core.i18n import parse_accept_language, translate
 from app.core.logging import configure_logging
@@ -28,7 +28,9 @@ from app.core.middleware import (
     RequestIDMiddleware,
     SecurityHeadersMiddleware,
 )
+from app.core.ratelimit import NoOpRateLimiter
 from app.core.readiness import RedisGateway, check_readiness
+from app.modules.identity.api.router import router as identity_router
 
 OPENAPI_URL = "/api/openapi.json"
 
@@ -112,7 +114,7 @@ def create_app(
     configure_logging(app_settings)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         # Неинжектированные зависимости создаём и закрываем сами (owned_*);
         # инжектированные (тестовые фейки) принадлежат вызывающему — не трогаем.
         engine: Any = db_engine
@@ -127,8 +129,12 @@ def create_app(
             client = owned_redis
         else:
             client = redis_client
-        app.state.db_engine = engine
-        app.state.redis_client = client
+        app_instance.state.db_engine = engine
+        app_instance.state.redis_client = client
+        app_instance.state.settings = app_settings
+        app_instance.state.session_factory = create_session_factory(engine)
+        # S1.4: NoOp; в S1.5 подменяется Redis-реализацией (core/ratelimit.py)
+        app_instance.state.rate_limiter = NoOpRateLimiter()
         try:
             yield
         finally:
@@ -152,6 +158,7 @@ def create_app(
     app.add_middleware(RequestIDMiddleware)
 
     _register_exception_handlers(app)
+    app.include_router(identity_router)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
