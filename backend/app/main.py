@@ -28,7 +28,7 @@ from app.core.middleware import (
     RequestIDMiddleware,
     SecurityHeadersMiddleware,
 )
-from app.core.ratelimit import NoOpRateLimiter
+from app.core.ratelimit import RedisRateLimiter
 from app.core.readiness import RedisGateway, check_readiness
 from app.modules.identity.api.router import router as identity_router
 
@@ -108,6 +108,7 @@ def create_app(
     settings: Settings | None = None,
     db_engine: Any | None = None,
     redis_client: RedisGateway | None = None,
+    rate_limiter: Any | None = None,
 ) -> FastAPI:
     """Собрать приложение; зависимости инжектируемы для тестов."""
     app_settings = settings or get_settings()
@@ -133,8 +134,11 @@ def create_app(
         app_instance.state.redis_client = client
         app_instance.state.settings = app_settings
         app_instance.state.session_factory = create_session_factory(engine)
-        # S1.4: NoOp; в S1.5 подменяется Redis-реализацией (core/ratelimit.py)
-        app_instance.state.rate_limiter = NoOpRateLimiter()
+        # Redis-лимитер на общем redis-клиенте (S1.5); fail-closed внутри.
+        # Инжектируемый (тесты) приоритетнее; client реальный — redis.Redis.
+        app_instance.state.rate_limiter = (
+            rate_limiter if rate_limiter is not None else RedisRateLimiter(client, app_settings)  # type: ignore[arg-type]
+        )
         try:
             yield
         finally:

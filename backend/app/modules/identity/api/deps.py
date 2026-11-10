@@ -1,20 +1,28 @@
 """Зависимости identity: сессия, текущий пользователь, настройки, rate-limiter."""
 
 from typing import Annotated
+from urllib.parse import urlparse
 
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.db import get_session
-from app.core.errors import AuthError
+from app.core.errors import AuthError, ForbiddenError
 from app.core.logging import bind_user_id
 from app.core.ratelimit import RateLimiter
 from app.core.security.jwt import TokenExpiredError, TokenInvalidError, decode_access
 from app.modules.identity import repository
 from app.modules.identity.models import User
 
-__all__ = ["CurrentUser", "DbSession", "get_app_settings", "get_current_user", "get_rate_limiter"]
+__all__ = [
+    "CurrentUser",
+    "DbSession",
+    "get_app_settings",
+    "get_current_user",
+    "get_rate_limiter",
+    "require_origin_guard",
+]
 
 DbSession = Annotated[AsyncSession, Depends(get_session)]
 
@@ -44,6 +52,40 @@ async def get_current_user(request: Request, session: DbSession) -> User:
         raise AuthError
     bind_user_id(str(user.id))
     return user
+
+
+async def try_get_current_user(request: Request, session: AsyncSession) -> User | None:
+    """Как get_current_user, но 401 -> None (logout-режим B: access истёк)."""
+    try:
+        return await get_current_user(request, session)
+    except AuthError:
+        return None
+
+
+def require_origin_guard(request: Request, settings: Settings) -> None:
+    """CSRF-guard для cookie-режима (SECURITY §2, STAGE_1_PLAN §9.1):
+
+    точное совпадение Origin (fallback — Referer, по origin-части) с
+    CP_ALLOWED_ORIGIN; несовпадение или отсутствие обоих -> 403 forbidden.
+    """
+    allowed = settings.allowed_origin
+    origin = request.headers.get("origin")
+    if origin is not None:
+        if origin == allowed:
+            return
+        raise ForbiddenError
+
+    referer = request.headers.get("referer")
+    if referer is not None:
+        # origin-часть Referer: scheme://host[:port]
+        try:
+            parsed = urlparse(referer)
+            referer_origin = f"{parsed.scheme}://{parsed.netloc}"
+        except ValueError:
+            raise ForbiddenError from None
+        if referer_origin == allowed:
+            return
+    raise ForbiddenError
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]

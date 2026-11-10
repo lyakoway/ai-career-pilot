@@ -10,6 +10,7 @@ __all__ = [
     "AppError",
     "AuthError",
     "ConflictError",
+    "ExternalServiceError",
     "ForbiddenError",
     "InternalError",
     "NotFoundError",
@@ -65,6 +66,13 @@ class ConflictError(AppError):
 class RateLimitError(AppError):
     code = "rate_limited"
     http_status = 429
+
+
+class ExternalServiceError(AppError):
+    """Внешняя зависимость недоступна; для auth — fail-closed 503 (STAGE_1_PLAN §9.3)."""
+
+    code = "external_service_error"
+    http_status = 503
 
 
 class InternalError(AppError):

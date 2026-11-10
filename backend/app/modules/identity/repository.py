@@ -22,6 +22,7 @@ __all__ = [
     "claim_refresh",
     "create_refresh_session",
     "create_user",
+    "get_refresh_status",
     "get_user_by_email",
     "get_user_by_id",
     "revoke_all_except",
@@ -66,7 +67,7 @@ async def claim_refresh(session: AsyncSession, token_hash: str) -> dict[str, Any
     """Атомарно отозвать токен и вернуть его данные; None — уже отозван/истёк/не существует.
 
     Семантика SECURITY §2: 0 затронутых строк => вызывающий классифицирует
-    (revoked -> reuse; expired/unknown -> обычная ошибка аутентификации).
+    через get_refresh_status (revoked -> reuse; expired/unknown -> 401).
     """
     result = await session.execute(
         update(RefreshToken)
@@ -82,6 +83,28 @@ async def claim_refresh(session: AsyncSession, token_hash: str) -> dict[str, Any
     if row is None:
         return None
     return {"id": row.id, "user_id": row.user_id}
+
+
+async def get_refresh_status(session: AsyncSession, token_hash: str) -> dict[str, Any]:
+    """Классификация токена после неудачного claim (S1.5): expired | revoked | missing.
+
+    Возвращает {"status": ..., "user_id": uuid | None}; для missing user_id=None.
+    """
+    result = await session.execute(
+        select(
+            RefreshToken.user_id,
+            RefreshToken.revoked_at,
+            RefreshToken.expires_at,
+        ).where(RefreshToken.token_hash == token_hash)
+    )
+    row = result.first()
+    if row is None:
+        return {"status": "missing", "user_id": None}
+    if row.revoked_at is not None:
+        return {"status": "revoked", "user_id": row.user_id}
+    if row.expires_at <= datetime.now(UTC):
+        return {"status": "expired", "user_id": row.user_id}
+    return {"status": "active", "user_id": row.user_id}
 
 
 async def revoke_all_for_user(session: AsyncSession, user_id: uuid.UUID) -> int:

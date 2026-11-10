@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.core.db import create_db_engine, create_session_factory
+from app.core.ratelimit import NoOpRateLimiter
 from app.core.security.jwt import decode_access
 from app.main import create_app
 from app.modules.identity import repository
@@ -45,6 +46,7 @@ def auth_client_factory(pg: dict[str, str]) -> Iterator[Any]:
             settings=_settings(pg, **overrides),
             db_engine=engine,
             redis_client=FakeRedis(),
+            rate_limiter=NoOpRateLimiter(),
         )
         client = TestClient(app)
         client.state_engine = engine  # type: ignore[attr-defined]

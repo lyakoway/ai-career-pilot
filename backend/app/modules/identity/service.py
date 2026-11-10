@@ -7,6 +7,7 @@ audit login.failed пишется ОТДЕЛЬНОЙ транзакцией (н�
 
 import hashlib
 import secrets
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -29,12 +30,16 @@ from app.modules.identity.models import User
 __all__ = [
     "AuthTokens",
     "InvalidCredentialsError",
+    "RefreshReuseDetectedError",
     "audit_failed_login",
     "change_password",
+    "handle_reuse",
     "issue_access_token",
     "login",
+    "logout",
     "new_refresh_token",
     "register_user",
+    "rotate_refresh",
 ]
 
 _REFRESH_PREFIX = "rt_"
@@ -42,6 +47,10 @@ _REFRESH_PREFIX = "rt_"
 
 class InvalidCredentialsError(Exception):
     """Неверный email или пароль (детали не раскрываются — SECURITY §2)."""
+
+
+class RefreshReuseDetectedError(Exception):
+    """Повторное использование отозванного refresh-токена (SECURITY §2, S1.5 AC)."""
 
 
 @dataclass(frozen=True)
@@ -162,6 +171,133 @@ async def audit_failed_login(
             request_id=request_id,
         )
         await session.commit()
+
+
+async def rotate_refresh(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    refresh_token: str,
+    ip: str | None,
+    user_agent: str | None,
+    request_id: str | None,
+) -> AuthTokens:
+    """Ротация refresh (STAGE_1_PLAN §9.1, S1.5): атомарный claim -> новая пара.
+
+    claim=0 строк -> классификация через get_refresh_status:
+      expired/missing -> InvalidCredentialsError (без массового отзыва);
+      revoked -> RefreshReuseDetectedError (вызывающий вызывает handle_reuse
+      с ОТДЕЛЬНОЙ транзакцией: массовый отзыв + audit, AC ⑥/⑦).
+    """
+    token_hash = _sha256(refresh_token)
+    claimed = await repository.claim_refresh(session, token_hash)
+
+    if claimed is None:
+        status = await repository.get_refresh_status(session, token_hash)
+        if status["status"] == "revoked":
+            raise RefreshReuseDetectedError
+        # expired / missing: одинаковый 401 без mass-revoke
+        raise InvalidCredentialsError
+
+    user = await repository.get_user_by_id(session, claimed["user_id"])
+    if user is None or not user.is_active:
+        # Пользователь удалён/деактивирован после выдачи токена
+        raise InvalidCredentialsError
+
+    tokens = await _issue_refresh(session, settings, user, ip=ip, user_agent=user_agent)
+    await repository.append_audit(
+        session,
+        user_id=user.id,
+        action="refresh.rotated",
+        resource_type="refresh_token",
+        resource_id=claimed["id"],
+        ip=ip,
+        user_agent=user_agent,
+        request_id=request_id,
+    )
+    return tokens
+
+
+async def handle_reuse(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: uuid.UUID,
+    ip: str | None,
+    user_agent: str | None,
+    request_id: str | None,
+) -> None:
+    """Reuse (AC ⑥/⑧): массовый отзыв + audit refresh.reuse_detected ОДНОЙ
+    транзакцией, коммит ДО 401-ответа (stateless-транзакция запроса откатится).
+    При исключении — rollback: ничего частичного не остаётся (AC ⑦).
+    """
+    async with session_factory() as session:
+        try:
+            revoked = await repository.revoke_all_for_user(session, user_id)
+            await repository.append_audit(
+                session,
+                user_id=user_id,
+                action="refresh.reuse_detected",
+                resource_type="user",
+                resource_id=user_id,
+                ip=ip,
+                user_agent=user_agent,
+                request_id=request_id,
+                context={"sessionsRevoked": revoked},
+            )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
+async def logout(
+    session: AsyncSession,
+    *,
+    user: User | None,
+    refresh_token: str | None,
+    ip: str | None,
+    user_agent: str | None,
+    request_id: str | None,
+) -> int:
+    """Logout (SECURITY §2): access+refresh -> отзыв ЕЁ; access без refresh ->
+    отзыв ВСЕХ активных сессий (зафиксированное решение S1.5); режим B
+    (без access, по валидной cookie) -> отзыв ЕЁ.
+
+    Возвращает число отозванных сессий; audit logout в транзакции запроса.
+    """
+    revoked = 0
+    mode = "all"
+    subject_id: uuid.UUID | None = None
+
+    if refresh_token is not None:
+        token_hash = _sha256(refresh_token)
+        status = await repository.get_refresh_status(session, token_hash)
+        subject_id = status["user_id"]
+        if status["status"] in ("active", "revoked"):
+            # active: атомарный claim = отзыв; revoked: уже отозвана —
+            # идемпотентный logout, оба случая считаем успешным выходом
+            mode = "single"
+            claimed = await repository.claim_refresh(session, token_hash)
+            revoked = 1 if claimed is not None else 0
+    elif user is not None:
+        subject_id = user.id
+        revoked = await repository.revoke_all_for_user(session, user.id)
+
+    if subject_id is None and user is not None:
+        subject_id = user.id
+
+    await repository.append_audit(
+        session,
+        user_id=subject_id,
+        action="logout",
+        resource_type="user",
+        resource_id=subject_id,
+        ip=ip,
+        user_agent=user_agent,
+        request_id=request_id,
+        context={"mode": mode, "sessionsRevoked": revoked},
+    )
+    return revoked
 
 
 async def change_password(

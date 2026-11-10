@@ -58,6 +58,33 @@ class PasswordChangeResponse(BaseModel):
     expires_in: int = Field(alias="expiresIn")
 
 
+class RefreshRequest(BaseModel):
+    """Body-режим: refresh в теле (cookie отсутствует); CLI/тесты."""
+
+    model_config = _base_config()
+
+    refresh_token: str = Field(alias="refreshToken")
+
+
+class RefreshResponse(BaseModel):
+    """Cookie-режим: refresh только в Set-Cookie; body-режим: refreshToken в теле."""
+
+    model_config = _base_config()
+
+    access_token: str = Field(alias="accessToken")
+    token_type: Literal["bearer"] = Field(alias="tokenType", default="bearer")
+    expires_in: int = Field(alias="expiresIn")
+    refresh_token: str | None = Field(
+        alias="refreshToken", default=None
+    )  # заполняется только в body-режиме
+
+
+class LogoutResponse(BaseModel):
+    model_config = _base_config()
+
+    status: Literal["ok"] = Field(alias="status", default="ok")
+
+
 class UserMe(BaseModel):
     """Профиль пользователя без секретов (password_hash не существует в DTO)."""
 
