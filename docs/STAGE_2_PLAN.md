@@ -1,6 +1,6 @@
 # CareerPilot AI — Stage 2 Implementation Plan (Resume Intelligence + Career Profile)
 
-- **Статус:** Draft v1.0 — план на ревью у владельца; реализация не начата.
+- **Статус:** **Accepted v1.1** — утверждён владельцем (решения Q-1…Q-8 внесены; Q-4 = Вариант A: без реального LLM-провайдера в Stage 2, mock-baseline harness-only). Реализация не начата.
 - **База:** HEAD `c15b080` (Stage 1 завершён: S1.0–S1.6, CI зелёный, 116 тестов).
 - План сверен с фактическими файлами: ROADMAP (Stage 2), AI_DESIGN §2/§3/§8/§9/§10, DATABASE §3.2–3.4/§3.12/§5/§6, SECURITY §2/§4/§6.1/§7/§8/§11, API_SPEC §1/§2.3/§2.4/§4/§8, EVALUATION §2/§4, DECISIONS ADR-003/004/011/013/016/021.
 - **Backend-only** (frontend-каркас — отдельный трек вне Stage 2, решение Q-1 владельца из ревью Stage 1-плана).
@@ -25,7 +25,7 @@ UJ-1 (PRD): пользователь загружает резюме (PDF/DOCX) 
 6. **Career Profiles CRUD**: POST/GET /career-profiles, GET/PATCH/DELETE /{id}, POST /{id}/activate; hard filters по схеме DATABASE §3.2.1; один активный (partial unique).
 7. **LLM-каркас** (`app/llm/`): LLMClient Protocol, Mock-провайдер (детерминированный, кассеты), structured outputs (Pydantic + retry на невалидный JSON), routing (роль→модель через конфиг), ai_invocations (tokens/cost/latency/trace_id — независимо от Langfuse), MaskingPolicy.
 8. **Langfuse fail-open** (ADR-011): обёртка трассировки; STRICT по умолчанию — метаданные без user_id/полных текстов; недоступность не влияет на продукт. Включение — Q-3.
-9. **Evaluation**: датасет `resume_extraction` (≥10 резюме, JSONL в git), harness `make eval`, baseline зафиксирован в `eval/baselines.json` (EVALUATION §5). Реальный LLM-провайдер — Q-4.
+9. **Evaluation**: датасет `resume_extraction` (≥10 резюме, JSONL в git), harness `make eval`, baseline зафиксирован в `eval/baselines.json` — **mock-baseline, harness-only** (Q-4=A: реальный провайдер в Stage 2 не подключается; реальные числа — отдельный этап после ADR по чек-листу SECURITY §8).
 10. **Выполнение пайплайна**: без Celery — asyncio background task + статусы в `resumes.status` + ограничение параллелизма (Semaphore); API отдаёт 202 и статус поллится.
 
 ### 2.2 Out of scope (осознанно)
@@ -133,8 +133,8 @@ PATCH action=edit → новый факт `source=user_input|merge`, стары�
 ### S2.0 — LLM-каркас (без реальных провайдеров)
 
 - **Цель:** контракт LLMClient + Mock + invocations + masking, всё тестируемо без сети.
-- **Задачи:** `llm/`-пакет (client, providers/mock, schemas: FactsExtraction schema v1, masking, invocations); Settings: `CP_LLM_ROLES__EXTRACTION=mock:mock-extractor-v1` (формат provider:model, список = fallback-цепочка), `CP_LLM_DEBUG_CONTENT=false`; миграция `0002` добавляет `ai_invocations` (DATABASE §3.12: user_id FK CASCADE nullable, purpose, provider, model, prompt_version, tokens_in/out, cost_usd numeric(10,6), latency_ms, trace_id, status, created_at; индексы user+created_at, purpose+created_at) + GRANT SELECT/INSERT для cp_app (без UPDATE/DELETE — append-only).
-- **Тесты (unit):** routing/fallback (первый падает → второй отвечает); retry при невалидном JSON (Mock с битым первым ответом); invocations записываются с usage/cost; masking STRICT не пропускает контент; unknown role → fail-fast старта.
+- **Задачи:** `llm/`-пакет (client, providers/mock — **детерминированный: кассеты по хешу входа, JSON-фикстуры с полным ответом**, не случайный; это гарантирует воспроизводимость тестов и S2.7-baseline), schemas: FactsExtraction schema v1, masking, invocations); Settings: `CP_LLM_ROLES__EXTRACTION=mock:mock-extractor-v1` (формат provider:model, список = fallback-цепочка), `CP_LLM_DEBUG_CONTENT=false`; миграция `0002` добавляет `ai_invocations` (DATABASE §3.12: user_id FK CASCADE nullable, purpose, provider, model, prompt_version, tokens_in/out, cost_usd numeric(10,6), latency_ms, trace_id, status, created_at; индексы user+created_at, purpose+created_at) + GRANT SELECT/INSERT для cp_app (без UPDATE/DELETE — append-only).
+- **Тесты (unit):** routing/fallback (первый падает → второй отвечает); retry при невалидном JSON (Mock с битым первым ответом); invocations записываются с usage/cost; **masking STRICT: не пропускает email/телефон, пропускает навыки/компании** (решение ревью §2.1); unknown role → fail-fast старта; Mock детерминирован (повторный вызов с тем же входом → идентичный ответ).
 - **Готово:** make test зелёный без сети; OpenAPI не изменился (нет эндпоинтов).
 
 ### S2.1 — Миграция домена + модели + repository
@@ -154,7 +154,7 @@ PATCH action=edit → новый факт `source=user_input|merge`, стары�
 ### S2.3 — Загрузка резюме + парсер
 
 - **Цель:** POST /resumes → 202 → status-поллинг; детерминированный текст+секции.
-- **Задачи:** `POST /api/v1/resumes` (multipart; magic bytes vs заявленный mime; 15 МБ; filename: только `[A-Za-z0-9._-]`, обрезка, key=серверный uuid); checksum-дедуп (повтор → 200 существующего, не 201); `GET /resumes`, `GET /resumes/{id}` (+factsSummary), `GET /resumes/{id}/file` (presign, только владелец), `DELETE /resumes/{id}` (S3-объект + порядок фактов §4.2-S2.1 + audit resume.deleted), `POST /resumes/{id}/reparse` (202, только если не running); parser worker (PDF: pypdf текст+страницы; DOCX: zipfile+defusedxml c XXE-off, traversal-check, лимиты распаковки 100 МБ/10k записей; секции — эвристика заголовков) + runner (env-allowlist, rlimits, timeout 60 s, temp-очистка); audit resume.uploaded/parsed/failed; язык документа (простая эвристика RU/EN по словарю).
+- **Задачи:** `POST /api/v1/resumes` (multipart; magic bytes vs заявленный mime; 15 МБ; filename: только `[A-Za-z0-9._-]`, обрезка, key=серверный uuid); checksum-дедуп (повтор → 200 существующего, не 201); `GET /resumes`, `GET /resumes/{id}` (+factsSummary), `GET /resumes/{id}/file` (presign, только владелец), `DELETE /resumes/{id}` (S3-объект + порядок фактов §4.2-S2.1 + audit resume.deleted), `POST /resumes/{id}/reparse` (202, только если не running); parser worker (PDF: pypdf>=4.0 текст+страницы; DOCX: zipfile+defusedxml (XXE-off, не xml.etree), traversal-check, лимиты распаковки 100 МБ/10k записей; секции — эвристика заголовков) + runner (env-allowlist, rlimits, timeout 60 s, temp-очистка); audit resume.uploaded/parsed/failed; язык документа (простая эвристика RU/EN по словарю).
 - **Тесты:** unit: magic bytes mismatch → 422; zip-bomb (фикстура с высокой компрессией) → 422 decompression_limit; XXE-фикстура (docx с external entity) → безопасно игнор/ошибка; traversal-имена записей → reject; filename-санитизация; rlimits-тест (скушать память → MemoryError в subprocess, родитель жив); env: subprocess НЕ видит CP_JWT_SECRET (worker пишет env-keys в отчёт — тест); integration: полный upload→parse на PG+MinIO (текстовая фикстура), статусы, reparse идемпотентен по checksum, presign только владелец, tenant-изоляция.
 - **Готово:** DoD-строка «файл → текст» работает; security-AC §6.1 зелёные.
 
@@ -182,9 +182,9 @@ PATCH action=edit → новый факт `source=user_input|merge`, стары�
 ### S2.7 — Evaluation harness + baseline
 
 - **Цель:** измеримое качество extraction (EVALUATION §3.1).
-- **Задачи:** `eval/datasets/resume_extraction/` (≥10 JSONL: file-ref фикстур + разметка фактов с цитатами; владелец размечает); `make eval` → `run_extract_eval.py`: прогон пайплайна (реальный провайдер — Q-4; при его отсутствии — явный отказ «baseline требует CP_LLM_ROLES__EXTRACTION != mock»), метрики P/R/F1, date-accuracy, unsupported-rate, per-reason отбраковки; отчёт + `baselines.json` (git); CI: отдельный job `eval` — только на Mock (дым: harness запускается, метрики считаются на эталонных кассетах) — реальные вызовы НЕ в CI.
+- **Задачи (Q-4=A):** `eval/datasets/resume_extraction/` (≥10 JSONL: file-ref фикстур + разметка фактов с цитатами; владелец размечает); `make eval` → `run_extract_eval.py`: прогон пайплайна на **Mock-кассетах**, метрики P/R/F1, date-accuracy, unsupported-rate, per-reason отбраковки — числа показывают качество **harness + пайплайна против эталона**, не качество реальной модели; отчёт + `baselines.json` (git, пометка `"baseline": "mock-baseline/harness-only"`); CI: job `eval` на Mock (дым: harness запускается, метрики считаются, воспроизводимость ±0) — реальные вызовы НЕ в CI. Подключение реального провайдера — **отдельный будущий этап (S2.7a-заготовка): ADR-022 + чек-лист SECURITY §8 + правка SECURITY §8 (см. §18-правка)**, по явному решению владельца.
 - **Тесты:** harness сам покрыт unit (метрики на рукотворных случаях); smoke-job зелёный.
-- **Готово:** baseline зафиксирован и закоммичен; повторный `make eval` воспроизводит ±0 (при той же модели).
+- **Готово:** mock-baseline зафиксирован и закоммичен; повторный `make eval` воспроизводит ±0 (детерминированные кассеты); harness готов принять реального провайдера без изменений (заменой роли в конфиге).
 
 ### S2.8 — Финализация: README/DoD/чистка
 
@@ -207,7 +207,10 @@ README (запуск Stage 2: storage-bootstrap, upload-curl, флоу подт�
 - Structured output: Pydantic-схема → JSON-режим провайдера; невалидный JSON/schema → 1 retry с diagnostic-сообщением → TransientExternalError (API → 502 external_service_error? Нет: пайплайн фоновый → resume failed + parse_error, ретрай reparse).
 - Routing/fallback: `CP_LLM_ROLES__{EXTRACTION, NORMALIZATION?}` — normalization детерминированная (справочник), LLM-роль одна: EXTRACTION (+EVAL_JUDGE на будущее). Формат `provider:model[,provider:model]`.
 - Cost: тариф-таблица в Settings (price per 1M tokens in/out per model) → cost_usd в invocations.
-- Masking STRICT — применяется к тому, что уходит в Langfuse; провайдеру контент идёт как есть (задача extraction требует текст резюме; это зафиксировано в SECURITY §8 как «LLM-провайдеры получают производные данные в объёме задачи»).
+- Masking STRICT — применяется к тому, что уходит в Langfuse; провайдеру контент идёт как есть (задача extraction требует текст резюме). Границы маскирования в extraction (решение ревью):
+  - **НЕ маскируются**: навыки, компании, технологии, должности — иначе extraction сломается;
+  - **маскируются**: email, телефон, ФИО — extraction их не требует (факты о навыках/опыте; ФИО не входит ни в один fact_type);
+  - тест в S2.0: STRICT не пропускает email/телефон, но пропускает навыки/компании.
 
 ## 10. Langfuse
 
@@ -227,7 +230,7 @@ README (запуск Stage 2: storage-bootstrap, upload-curl, флоу подт�
 | Parser security (unit) | magic-bytes mismatch → 422; zip-bomb → 422 decompression_limit; XXE-фикстура не резолвит external entities; traversal-записи отклонены; subprocess не видит секретов (CP_JWT_SECRET отсутствует в его env — проверяет сам worker); rlimits: жрущий память worker убит, API жив; таймаут 60 s → parser_timeout |
 | Analyzer (unit) | evidence: (1) цитата найдена в тексте или факт отбрасывается; (2) сущность факта присутствует в цитате; confidence<0.5 → нет draft; дедуп по канон-ключу; merge добавляет evidence к confirmed, не перезаписывая payload |
 | Analyzer (integration, Mock-кассеты) | фикс-резюме → детерминированный набор фактов; fact без quote отсутствует в БД; invocations строки с usage/cost/prompt_version |
-| Facts/Profiles API | confirm/edit/reject (+superseded-цепочка); expectedUpdatedAt → 409; manual add (source=user_input, evidence=null ok); hard_filters валидация; activate — ровно один active; tenant A≠B (404); audit-события |
+| Facts/Profiles API | confirm/edit/reject (+superseded-цепочка); expectedUpdatedAt → 409; manual add (source=user_input, evidence=null ok); hard_filters валидация; activate — ровно один active (атомарный partial-unique-переключатель); GET facts доступен и для НЕактивного профиля (Q-1); авто-Default при первой загрузке, не создаётся если профиль уже есть (Q-1); tenant A≠B (404); audit-события |
 | Resumes lifecycle | upload→202→parsed; checksum-дедуп; DELETE: confirmed-факты пережили, драфты удалены, S3-объект удалён; reparse не трогает confirmed; presign только владелец, TTL≤900 |
 | LLM-каркас | routing/fallback; retry JSON; unknown role → старт fail; invocations append-only (cp_app без UPDATE) |
 | Langfuse | fail-open (битые ключи — продукт работает); masking (нет user_id/email/полных текстов в экспорте); без ключей — пассивна |
@@ -247,7 +250,7 @@ README (запуск Stage 2: storage-bootstrap, upload-curl, флоу подт�
 | BackgroundTasks теряются при рестарте API | resume застревает в parsing → watchdog-рекавери при старте (переводит в failed) — S2.4 |
 | pypdf не тянет текст сложных PDF | честная ошибка parse_notext; OCR — вне Stage 2 |
 | Датасет мал (10 резюме, 1 разметчик) | метрики — тренды; фиксируем per-case отчёт для ручного анализа (EVALUATION §8) |
-| Реальный провайдер не выбран (Q-4) | весь Stage 2 функционален на Mock; baseline — единственный блокер |
+| Реальный провайдер не подключён (Q-4=A) | весь Stage 2 функционален на Mock; mock-baseline закрывает DoD; реальные числа — будущий этап с ADR-022 |
 | skills.csv неполный | ненормализованные навыки не теряются (skill_id null) |
 
 ## 15. Definition of Done
@@ -259,7 +262,7 @@ README (запуск Stage 2: storage-bootstrap, upload-curl, флоу подт�
 5. Tenant-изоляция на всех новых эндпоинтах (404-матрица).
 6. ai_invocations пишутся; cp_app не имеет UPDATE/DELETE на них и на audit_events.
 7. Langfuse: выключена → продукт идентичен; битые ключи → fail-open (тесты).
-8. `make eval` воспроизводим; baseline.json в git; CI eval-smoke зелёный.
+8. `make eval` воспроизводим (±0 на Mock-кассетах); baselines.json в git с пометкой mock-baseline/harness-only; CI eval-smoke зелёный.
 9. Миграции up/down чистые; схема == DATABASE §3.2–3.3/§3.12 (авто-тест).
 10. CI полностью зелёный; OpenAPI-детерминизм; README обновлён.
 
@@ -281,23 +284,26 @@ flowchart LR
 
 S2.0∥S2.1∥S2.2 параллельны; S2.6 — в любой момент после S2.0.
 
-## 17. Спорные решения (требуют подтверждения)
+## 17. Решения владельца по итогам ревью (Q-1…Q-8)
 
-| # | Вопрос | Рекомендация |
+Все восемь вопросов закрыты (см. таблицу); Q-4 — Вариант A (без реального провайдера). Дальнейшие правки плана — через ревью.
+
+| # | Вопрос | Решение владельца |
 |---|---|---|
-| Q-1 | Профиль до фактов: DATABASE требует career_profile_id NOT NULL у фактов, UJ-1 загружает резюме до создания профиля | Авто-создание профиля `Default` при первой загрузке (is_active=false до явной activate); альтернатива — требовать POST /career-profiles до upload (UX хуже) |
-| Q-2 | Локальные версии промптов | Хранить промпт в git (llm/prompts/*.md) как источник правды; Langfuse Prompt Management не используем в Stage 2 (нет двойного источника) |
-| Q-3 | Langfuse в Stage 2 | Код готов, выключен (без ключей); self-host/Cloud — отдельное решение позже |
-| Q-4 | Реальный LLM-провайдер | Подключить openai-совместимый в S2.7 только для `make eval` и ручного парсинга: выбрать провайдера по чек-листу SECURITY §8, ключи в env, CI — без ключей. Без этого baseline невозможен (In scope его требует) |
-| Q-5 | Библиотеки парсера | pypdf (PDF) + собственный безопасный DOCX-ридер (zipfile+defusedxml) — минимум зависимостей; python-docx/mammoth — отклонены (лишняя поверхность) |
-| Q-6 | MinIO в compose | always (функционально обязателен), profile `langfuse` — off |
-| Q-7 | embed() | Отложить целиком в Stage 4 (не тащить пустую абстракцию) |
-| Q-8 | DELETE /resumes/{id} | Файл+S3-объект удаляются; confirmed-факты переживают (evidence→«источник удалён»), draft — каскад; подтверждено DATABASE §3.3 |
+| Q-1 | Профиль до фактов | **APPROVED**: авто-Default при первой загрузке (is_active=false до activate); GET /career-profiles/{id}/facts доступен и для неактивного профиля (иначе пользователь не увидит факты до активации — отражено в S2.5-AC); activate атомарно переключает partial unique; если пользователь создал свой профиль до загрузки — Default не создаётся, факты идут в его (первый) профиль |
+| Q-2 | Локальные версии промптов | **APPROVED**: git (llm/prompts/*.md) — источник правды; Langfuse Prompt Management — нет |
+| Q-3 | Langfuse в Stage 2 | **APPROVED**: код готов, выключен (без ключей); self-host/Cloud — отдельное решение |
+| Q-4 | Реальный LLM-провайдер | **APPROVED (Вариант A)**: в Stage 2 НЕ подключаем; `make eval` на Mock-кассетах, baseline = «harness воспроизводим» (mock-baseline/harness-only, пометка в baselines.json); реальные числа — будущий отдельный этап: ADR-022 + чек-лист SECURITY §8 + правка SECURITY §8 (§18) по явному решению владельца |
+| Q-5 | Библиотеки парсера | **APPROVED**: pypdf **>=4.0** (актуальные CVE-исправления) + собственный DOCX-ридер на **defusedxml** (не xml.etree — XXE-off обязателен); python-docx/mammoth — отклонены |
+| Q-6 | MinIO в compose | **APPROVED**: always; profile `langfuse` — off |
+| Q-7 | embed() | **APPROVED**: отложен в Stage 4 |
+| Q-8 | DELETE /resumes/{id} | **APPROVED**: confirmed переживают (перенос resume_id→NULL до DELETE — порядок операций тест-закреплён в S2.1), draft — каскад; файл+S3-объект удаляются |
 
 ## 18. Обнаруженные противоречия документации
 
 1. **DATABASE §3.3 vs сам себя (не блокирует)**: FK `resume_id ON DELETE CASCADE` + правило «confirmed-факты переживают удаление». Не конфликт схемы, а порядок операций: перенос confirmed до DELETE (тест-закреплено в S2.1). Правок docs не требуется — правило уже описывает поведение приложения.
-2. **EVALUATION §1 vs ТЗ-протяжка**: «датасеты — git», но DATABASE описывает evaluation_* таблицы. Решение: git (по EVALUATION), таблицы — Stage 3+; расхождение вносит сам план — зафиксировано, DATABASE правок не требует (таблицы описаны как реестр прогонов, не хранение датасетов).
+2. **EVALUATION §1 vs DATABASE**: «датасеты — git», но DATABASE описывает evaluation_* таблицы. **Решение ревью (закрыто)**: evaluation_* таблицы — Stage 3+ (реестр прогонов, НЕ хранение датасетов); в Stage 2 — git-датасеты по EVALUATION §1. Формальное расхождение закрыто.
+3. **SECURITY §8 vs Stage 2-extraction**: фактически SECURITY.md:132 говорит «LLM-провайдеры… в объёме **генерации**» — формально не покрывает extraction (Stage 2); при этом SECURITY.md:21 (§1) уже говорит «в объёме **задачи**». Требуется additive-правка §8 (не ослабление, приведение к факту): см. diff в отчёте ревью; применяется отдельным docs-коммитом после утверждения плана — в этом коммите НЕ правится. Актуально только при будущем подключении реального провайдера (Q-4=A в Stage 2 провайдера нет — блокера нет).
 3. Явных конфликтов DATABASE ↔ AI_DESIGN по profile_facts не нашёл: обе стороны согласованы (evidence обязателен для llm_extraction; confirmed-only в downstream).
 
 ## 19. Само-аудит плана
@@ -305,6 +311,6 @@ S2.0∥S2.1∥S2.2 параллельны; S2.6 — в любой момент �
 - **ADR**: 003/004 (pgvector/embeddings отложены — согласовано с Q-7), 011 (Langfuse fail-open, выключена — согласовано), 013 (секреты env), 016 (uuid7 во всех новых PK), 021 (single-user, без SaaS-фич). ✅
 - **Security**: §6.1 subprocess-контракты все в AC; §7 — промпт с «контент=данные» + без tool-execution; §8 — провайдер только по Q-4 чек-листу; §11 — audit-события расширены типами фактов (additive). Masking не ослаблен. ✅
 - **Протечек Stage 3+ нет**: ни sources/matching/copilot/Celery/LangGraph/pgvector; background-task обоснован отказом от Celery до Stage 3. ✅
-- **Зависимости**: aioboto3, pypdf, defusedxml, (опц. openai-sdk по Q-4) — всё обосновано; Mock — собственный. ✅
+- **Зависимости**: aioboto3, pypdf>=4.0, defusedxml — всё обосновано; openai-sdk в Stage 2 НЕ добавляется (Q-4=A); Mock — собственный. ✅
 - **Декомпозиция**: S2.0–S2.8 по 1–3 коммита. ✅
 - **AC объективны**: все проверяемы тестами/командами. ✅
