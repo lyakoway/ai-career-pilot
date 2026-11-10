@@ -13,8 +13,23 @@ from alembic.config import Config
 from alembic import command
 from tests.conftest import fetch_all, run_write
 
-EXPECTED_TABLES = {"users", "refresh_tokens", "audit_subjects", "audit_events"}
+EXPECTED_TABLES = {"users", "refresh_tokens", "audit_subjects", "audit_events", "ai_invocations"}
 EXPECTED_COLUMNS = {
+    "ai_invocations": {
+        "id",
+        "user_id",
+        "purpose",
+        "provider",
+        "model",
+        "prompt_version",
+        "tokens_in",
+        "tokens_out",
+        "cost_usd",
+        "latency_ms",
+        "trace_id",
+        "status",
+        "created_at",
+    },
     "users": {
         "id",
         "email",
@@ -113,7 +128,7 @@ def test_schema_matches_database_doc(pg: dict[str, str]) -> None:
         admin,
         "SELECT table_name, column_name FROM information_schema.columns "
         "WHERE table_schema = 'public' AND table_name IN "
-        "('users','refresh_tokens','audit_subjects','audit_events')",
+        "('users','refresh_tokens','audit_subjects','audit_events','ai_invocations')",
     )
     columns: dict[str, set[str]] = {}
     for row in rows:
@@ -149,6 +164,7 @@ def test_schema_matches_database_doc(pg: dict[str, str]) -> None:
     assert {r["conname"] for r in fks} == {
         "fk_refresh_tokens_user_id_users",
         "fk_audit_subjects_user_id_users",
+        "ai_invocations_user_id_fkey",
     }
     # asyncpg возвращает PG-тип "char" как bytes (b"c")
     assert all(r["confdeltype"] in (b"c", "c") for r in fks)  # ON DELETE CASCADE

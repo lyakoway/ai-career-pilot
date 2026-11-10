@@ -118,8 +118,8 @@ async def _reset_to_base(admin_url: str) -> None:
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS audit_events, audit_subjects, "
-                    "refresh_tokens, users, alembic_version CASCADE"
+                    "DROP TABLE IF EXISTS ai_invocations, audit_events, "
+                    "audit_subjects, refresh_tokens, users, alembic_version CASCADE"
                 )
             )
             await conn.execute(text("DROP EXTENSION IF EXISTS citext"))
@@ -201,7 +201,7 @@ def run_write(url: str, sql: str, params: dict[str, Any] | None = None) -> None:
     asyncio.run(_write(url, sql, params))
 
 
-_TABLES = ("audit_events", "audit_subjects", "refresh_tokens", "users")
+_TABLES = ("ai_invocations", "audit_events", "audit_subjects", "refresh_tokens", "users")
 
 
 async def _truncate(admin_url: str) -> None:

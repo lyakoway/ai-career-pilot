@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     rate_limit_login_failures_per_account: int = Field(default=10, gt=0)
     rate_limit_login_failures_window_seconds: int = Field(default=900, gt=0)
 
+    # --- LLM (Stage 2; Q-4=A: провайдер только mock) ---
+    # Формат: provider:model[,provider:model] — список = fallback-цепочка.
+    llm_roles__extraction: str = "mock:mock-extractor-v1"
+    llm_debug_content: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
@@ -64,6 +69,22 @@ class Settings(BaseSettings):
         if self.log_format is not None:
             return self.log_format
         return "json" if self.is_production else "console"
+
+    def _validate_llm_roles(self) -> None:
+        """Fail-fast: роль должна быть непустой цепочкой provider:model (S2.0)."""
+        for field_name in ("llm_roles__extraction",):
+            chain = getattr(self, field_name).strip()
+            if not chain:
+                msg = f"{field_name} must not be empty"
+                raise ValueError(msg)
+            for entry in chain.split(","):
+                provider, _, model = entry.strip().partition(":")
+                if not provider or not model or ":" in model:
+                    msg = (
+                        f"{field_name} entry {entry!r} must be 'provider:model' "
+                        "(comma-separated fallback chain)"
+                    )
+                    raise ValueError(msg)
 
     @field_validator("jwt_secret", "ratelimit_hmac_key")
     @classmethod
@@ -87,6 +108,7 @@ class Settings(BaseSettings):
         if unknown:
             msg = f"Unknown CP_* environment variables: {unknown}"
             raise ValueError(msg)
+        self._validate_llm_roles()
         if self.is_production:
             if not self.cookie_secure:
                 msg = "CP_COOKIE_SECURE=false is forbidden in production"
