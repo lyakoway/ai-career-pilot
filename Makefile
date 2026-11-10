@@ -3,7 +3,7 @@
 DB_ADMIN_URL ?= postgresql://postgres:postgres@localhost:5432/careerpilot
 CP_MIGRATIONS_DATABASE_URL ?= postgresql+asyncpg://cp_migrations:cp_migrations@localhost:5432/careerpilot
 
-.PHONY: help install lock lint fmt type test up down ps bootstrap migrate migrate-down provision-owner
+.PHONY: help install lock lint fmt type test up down ps logs bootstrap migrate migrate-down provision-owner openapi
 
 help: ## Показать список целей
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -34,6 +34,12 @@ down: ## docker compose down
 
 ps: ## Статус сервисов compose
 	docker compose -f docker/docker-compose.yml ps
+
+logs: ## Логи сервисов compose (follow)
+	docker compose -f docker/docker-compose.yml logs -f
+
+openapi: ## Сгенерировать backend/openapi.json (детерминированно)
+	cd backend && uv run python scripts/export_openapi.py openapi.json
 
 bootstrap: ## Накатить bootstrap.sql (роли cp_app/cp_migrations) на запущенный db
 	psql "$(DB_ADMIN_URL)" -f backend/docker/db/bootstrap.sql
