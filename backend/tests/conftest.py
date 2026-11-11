@@ -118,10 +118,14 @@ async def _reset_to_base(admin_url: str) -> None:
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "DROP TABLE IF EXISTS ai_invocations, audit_events, "
-                    "audit_subjects, refresh_tokens, users, alembic_version CASCADE"
+                    "DROP TABLE IF EXISTS ai_invocations, audit_events, profile_facts, "
+                    "resumes, career_profiles, audit_subjects, refresh_tokens, "
+                    "users, alembic_version CASCADE"
                 )
             )
+            # enums миграции 0003 (drop таблиц их не удаляет)
+            for enum_name in ("resume_status", "fact_type", "fact_status", "fact_source"):
+                await conn.execute(text(f"DROP TYPE IF EXISTS {enum_name}"))
             await conn.execute(text("DROP EXTENSION IF EXISTS citext"))
     finally:
         await engine.dispose()
@@ -201,7 +205,16 @@ def run_write(url: str, sql: str, params: dict[str, Any] | None = None) -> None:
     asyncio.run(_write(url, sql, params))
 
 
-_TABLES = ("ai_invocations", "audit_events", "audit_subjects", "refresh_tokens", "users")
+_TABLES = (
+    "ai_invocations",
+    "audit_events",
+    "audit_subjects",
+    "refresh_tokens",
+    "resumes",
+    "profile_facts",
+    "career_profiles",
+    "users",
+)
 
 
 async def _truncate(admin_url: str) -> None:

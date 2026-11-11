@@ -20,7 +20,7 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TABLE ai_invocations (
-            id            uuid PRIMARY KEY,
+            id            uuid CONSTRAINT pk_ai_invocations PRIMARY KEY,
             user_id       uuid REFERENCES users(id) ON DELETE CASCADE,
             purpose       text NOT NULL,
             provider      text NOT NULL,

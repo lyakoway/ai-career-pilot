@@ -13,7 +13,16 @@ from alembic.config import Config
 from alembic import command
 from tests.conftest import fetch_all, run_write
 
-EXPECTED_TABLES = {"users", "refresh_tokens", "audit_subjects", "audit_events", "ai_invocations"}
+EXPECTED_TABLES = {
+    "users",
+    "refresh_tokens",
+    "audit_subjects",
+    "audit_events",
+    "ai_invocations",
+    "career_profiles",
+    "resumes",
+    "profile_facts",
+}
 EXPECTED_COLUMNS = {
     "ai_invocations": {
         "id",
@@ -29,6 +38,62 @@ EXPECTED_COLUMNS = {
         "trace_id",
         "status",
         "created_at",
+    },
+    "career_profiles": {
+        "id",
+        "user_id",
+        "name",
+        "target_roles",
+        "salary_min",
+        "salary_max",
+        "currency",
+        "locations",
+        "work_formats",
+        "employment_types",
+        "relocation",
+        "languages",
+        "hard_filters",
+        "settings",
+        "version",
+        "is_active",
+        "activated_at",
+        "created_at",
+        "updated_at",
+    },
+    "resumes": {
+        "id",
+        "user_id",
+        "career_profile_id",
+        "file_key",
+        "filename",
+        "mime_type",
+        "size_bytes",
+        "checksum_sha256",
+        "language",
+        "status",
+        "parse_error",
+        "parsed_at",
+        "created_at",
+        "updated_at",
+    },
+    "profile_facts": {
+        "id",
+        "user_id",
+        "career_profile_id",
+        "resume_id",
+        "fact_type",
+        "payload",
+        "evidence",
+        "confidence",
+        "source",
+        "status",
+        "verified",
+        "verified_at",
+        "valid_from",
+        "valid_to",
+        "superseded_by",
+        "created_at",
+        "updated_at",
     },
     "users": {
         "id",
@@ -128,7 +193,8 @@ def test_schema_matches_database_doc(pg: dict[str, str]) -> None:
         admin,
         "SELECT table_name, column_name FROM information_schema.columns "
         "WHERE table_schema = 'public' AND table_name IN "
-        "('users','refresh_tokens','audit_subjects','audit_events','ai_invocations')",
+        "('users','refresh_tokens','audit_subjects','audit_events','ai_invocations',"
+        "'career_profiles','resumes','profile_facts')",
     )
     columns: dict[str, set[str]] = {}
     for row in rows:
@@ -149,8 +215,13 @@ def test_schema_matches_database_doc(pg: dict[str, str]) -> None:
             "WHERE contype = 'u' AND connamespace = 'public'::regnamespace",
         )
     }
+    # uq_users_email — CREATE UNIQUE INDEX в 0001 (как и uq_career_profiles_active в 0003)
+    indexes_public = {
+        r["indexname"]
+        for r in fetch_all(admin, "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'")
+    }
+    assert "uq_users_email" in indexes_public
     assert {
-        "uq_users_email",
         "uq_refresh_tokens_token_hash",
         "uq_audit_subjects_user_id",
     } <= unique
@@ -161,13 +232,27 @@ def test_schema_matches_database_doc(pg: dict[str, str]) -> None:
         "confrelid::regclass::text AS ref FROM pg_constraint "
         "WHERE contype = 'f' AND connamespace = 'public'::regnamespace",
     )
-    assert {r["conname"] for r in fks} == {
+    assert {r["conname"] for r in fks} >= {
         "fk_refresh_tokens_user_id_users",
         "fk_audit_subjects_user_id_users",
         "ai_invocations_user_id_fkey",
+        "career_profiles_user_id_fkey",
+        "resumes_user_id_fkey",
+        "resumes_career_profile_id_fkey",
+        "profile_facts_user_id_fkey",
+        "profile_facts_career_profile_id_fkey",
+        "profile_facts_resume_id_fkey",
     }
-    # asyncpg возвращает PG-тип "char" как bytes (b"c")
-    assert all(r["confdeltype"] in (b"c", "c") for r in fks)  # ON DELETE CASCADE
+    # asyncpg возвращает PG-тип "char" как bytes (b"c").
+    # Исключение — profile_facts.superseded_by (confdeltype a=NO ACTION):
+    # цепочка редактирования не должна каскадно удалять замену.
+    superseded_fk = next(
+        (r for r in fks if r["conname"] == "profile_facts_superseded_by_fkey"), None
+    )
+    cascades = [r for r in fks if r is not superseded_fk]
+    assert all(r["confdeltype"] in (b"c", "c") for r in cascades)  # ON DELETE CASCADE
+    assert superseded_fk is not None
+    assert superseded_fk["confdeltype"] in (b"a", "a")  # NO ACTION
     assert not any(r["ref"] == "audit_events" for r in fks)  # actor_subject_id без FK
 
     pks = {

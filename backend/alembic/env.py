@@ -15,7 +15,11 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 from app.core.config import get_settings
 from app.core.db import Base
+from app.modules.career_profile import models as _cp_models  # noqa: F401 — metadata
 from app.modules.identity import models  # noqa: F401 — регистрация моделей в metadata
+from app.modules.resume_intelligence import (  # noqa: F401 — metadata
+    models as _ri_models,
+)
 
 config = context.config
 
